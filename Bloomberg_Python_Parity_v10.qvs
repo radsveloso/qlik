@@ -1,0 +1,2451 @@
+///$tab 00 — Config
+// VERSÃO v10 (sessão Claude Opus): feita a partir do v3. Mudanças em CHANGES_v10.md.
+// Nunca executada em um Qlik até a criação deste arquivo.
+TRACE [CASTINE] Script Bloomberg_Python_Parity v10;
+// ============================================================================
+// Bloomberg_Python_Parity.qvs
+// Migração fiel do Castine.py (Bloomberg XML -> Split Matrix -> Production
+// Earned -> Daily Payout) para Qlik Sense — paridade 1:1 com o Python.
+//
+// Referência funcional: Castine.py (3.833 linhas). Cada seção cita as
+// funções Python correspondentes. NADA aqui inventa regra: toda lógica
+// espelha uma linha do Python (rastreabilidade em 02_BUSINESS_RULES_MAPPING.md).
+//
+// MODELO FINAL: BLOOMBERG_FINAL_PYTHON_PARITY (23 colunas oficiais)
+//               + AUDIT_ETAPAS (contadores por etapa p/ reconciliação)
+// Tabelas de alerta: armazenadas em vLibOutput (STORE) e removidas do modelo
+// para evitar chaves sintéticas acidentais (vKeepAlertTables=1 mantém, qualificadas).
+// ============================================================================
+
+// ---------------------------------------------------------------------------
+// ÚNICO LUGAR para trocar conexões (prompt §7): ajuste apenas estas variáveis.
+// ---------------------------------------------------------------------------
+SET vLibXML       = 'lib://Bloomberg_XML/';                 // \\...\Trading\bloomberg\ftp
+SET vLibSalesData = 'lib://Sales_Data/';                    // \\...\Qlikview\Sales\Data
+SET vLibTiara     = 'lib://Sales_Data/Tiara Accounts/';     // subpasta de Sales\Data
+SET vLibRepo      = 'lib://Broadridge_Reports/';            // \\...\Operations\BroadridgeData\Reports
+SET vLibSplit     = 'lib://Split_Matrix/';                  // pasta do split matrix Castine V2.xlsx
+SET vLibOutput    = 'lib://Castine_Parity_Out/';            // saída de STOREs (QVD/CSV de auditoria)
+
+// --- Python CONFIG (Castine.py L74-185) ------------------------------------
+SET vXmlPattern            = 'f392fd1.ext.26*.4';           // file_glob_pattern
+SET vDateLimitToken        = '';                            // date_limit_token (vazio = None)
+SET vSplitMatrixFile       = 'split matrix Castine V2.xlsx';// split_matrix_path (nome do arquivo)
+SET vSplitSheetCandidates  = 'Split;Sheet1;Plan1;Matrix;split matrix;Castine'; // Qlik não enumera abas de xlsx: candidatos (Python varre todas)
+SET vApplySplit            = 1;                             // apply_split = True
+LET vSplitSumTolerance     = 0.001;                         // SPLIT_SUM_TOLERANCE
+SET vRepoPrefixes          = 'YTDSalesCommission_;RepoSalesCommission_;YTDSalesComission_;RepoSalesComission_;YTDSalesCommission;RepoSalesCommission;YTDSalesComission;RepoSalesComission';
+SET vRepoSource            = 'Repo';                        // repo_source_hardcoded
+SET vRepoCurrency          = 'USD';                         // repo_currency_hardcoded
+SET vRepoBuySell           = 'B';                           // repo_buysell_hardcoded
+SET vAdjPrefixes           = 'adjustments DailyExportOfPayout_;adjustments DailyExportOfPayout;adjustments_DailyExportOfPayout_;adjustments_DailyExportOfPayout;adjustmentsDailyExportOfPayout_;adjustmentsDailyExportOfPayout';
+SET vLegacyTradeYear       = 2026;                          // ano fixo da regra GNCL/MULT/GNPL (exclude_legacy_roll_shortdesc_records L1841-1843)
+SET vPreferCostOutsideTxc  = 1;                             // PREFER_COST_OUTSIDE_TRANSACTIONCOSTS
+SET vAllowTxcFallback      = 1;                             // ALLOW_TRANSACTIONCOST_FALLBACK
+SET vStoreOutputs          = 1;                             // 1 = STORE tabela final + alertas em vLibOutput
+SET vKeepAlertTables       = 0;                             // 1 = mantém alertas no modelo (qualificados)
+SET vMaxTagOcc             = 8;                             // limite de varredura p/ "primeira ocorrência não-vazia" (DFS do Python é ilimitado; 8 cobre os feeds reais — auditado em AUDIT_XML_SCAN)
+
+// Independência de locale: interpretação numérica/data controlada explicitamente
+SET ThousandSep = ',';
+SET DecimalSep  = '.';
+SET DateFormat  = 'M/D/YYYY';
+SET TimestampFormat = 'M/D/YYYY h:mm:ss[.fff] TT';
+
+// Defaults de contadores de auditoria (sobrescritos durante a carga; garantem
+// AUDIT_ETAPAS íntegro mesmo em ramos não executados)
+SET vTotalTradesParsed=0; SET vRowsAfterVersioning=0; SET vRowsAfterCancels=0; SET vCancelsRemoved=0;
+SET vXmlRowsMapped=0; SET vXmlRowsDropped=0; SET vXmlRowsKept=0; SET vXmlNonUsdExcluded=0;
+SET vCoreRows=0; SET vGnclExcluded=0; SET vBusinessExcluded=0; SET vAdjRows=0; SET vFinalRows=0;
+SET vSplitValidRows=0; SET vNumXmlFiles=0;
+SET vTiaraAccountsStatus='NOT_LOADED'; SET vTiaraSubStatus='NOT_LOADED';
+SET vTiaraAccountsFile=''; SET vTiaraSubFile='';
+
+// Sentinelas de datas de comparação (load_split_matrix_castine L1421-1422)
+LET vTsMin = Num(MakeDate(1900,1,1));     // pd.Timestamp('1900-01-01')
+LET vTsMax = Num(MakeDate(2262,4,11));    // pd.Timestamp('2262-04-11') = pandas Timestamp.max (data)
+LET vTsFloorMin = Num(MakeDate(1677,9,21)); // pd.Timestamp.min (ordenação do versionamento, L1225)
+
+// listas prontas para FOR EACH (FOR EACH não itera sobre SubField de 2 parâmetros)
+LET vSplitSheetList = Chr(39) & Replace('$(vSplitSheetCandidates)', ';', Chr(39) & ',' & Chr(39)) & Chr(39);
+LET vRepoPrefixList = Chr(39) & Replace('$(vRepoPrefixes)', ';', Chr(39) & ',' & Chr(39)) & Chr(39);
+LET vAdjPrefixList  = Chr(39) & Replace('$(vAdjPrefixes)', ';', Chr(39) & ',' & Chr(39)) & Chr(39);
+LET vAdjSheetList   = Chr(39) & Replace('Sheet1;Plan1;$(vSplitSheetCandidates)', ';', Chr(39) & ',' & Chr(39)) & Chr(39);
+
+///$tab 01 — Funções
+// ============================================================================
+// 01 — FUNÇÕES (variáveis-função; $1 = argumento textual)
+// Cada uma espelha 1 função do Python citada no comentário.
+// ============================================================================
+
+// normalize_team_key (L679-693): NBSP/zero-width/BOM -> espaço/nada, trim,
+// colapsa espaços (re \s+ -> ' '), UPPER. 5 passes de '  '->' ' cobrem runs <= 32.
+SET fNormTeam = Upper(Trim(Replace(Replace(Replace(Replace(Replace(Replace(Replace(Replace(Replace(Replace(Replace(Text($1) & '', Chr(160),' '), Chr(8203),''), Chr(65279),''), Chr(9),' '), Chr(10),' '), Chr(13),' '), '  ',' '), '  ',' '), '  ',' '), '  ',' '), '  ',' ')));
+
+// normalize_currency (L696-704): NBSP etc, trim, UPPER, remove aspas, remove TODO espaço
+SET fNormCurrency = PurgeChar(Upper(Replace(Replace(Replace(Text($1) & '', Chr(160),' '), Chr(8203),''), Chr(65279),'')), '"' & Chr(39) & ' ' & Chr(9) & Chr(10) & Chr(13));
+
+// header_norm (L707-711): lower + somente [a-z0-9]
+SET fHeaderNorm = KeepChar(Lower(Text($1)), 'abcdefghijklmnopqrstuvwxyz0123456789');
+
+// prefix_apostrophe (L883-893): não-vazio ganha apóstrofo inicial único
+SET fPrefixApos = If(Len(Trim(Text($1)))=0 or Lower(Trim(Text($1)))='nan', '', If(Left(Trim(Text($1)),1)=Chr(39), Trim(Text($1)), Chr(39) & Trim(Text($1))));
+
+// Arredondamento HALF-TO-EVEN (semântica numpy .round(): escala, rint, desescala)
+// pandas Series.round(2) == np.round: multiplica por 100, arredonda metade-para-par, divide.
+SET fRint = If(Frac($1)=0.5, If(Even(Floor($1)), Floor($1), Floor($1)+1), Round($1));
+SET fRound2  = (If(Frac(($1)*100)=0.5, If(Even(Floor(($1)*100)), Floor(($1)*100), Floor(($1)*100)+1), Round(($1)*100))/100);
+SET fRound10 = (If(Frac(($1)*10000000000)=0.5, If(Even(Floor(($1)*10000000000)), Floor(($1)*10000000000), Floor(($1)*10000000000)+1), Round(($1)*10000000000))/10000000000);
+
+// fmt_mdy_no_zeros (L646-650): M/D/YYYY sem zeros à esquerda; null -> ''
+// ($1 = data numérica Qlik ou null)
+SET fFmtMDY = If(Len($1 & '')=0, '', Num(Month($1)) & '/' & Num(Day($1)) & '/' & Num(Year($1)));
+
+// --- Datas -------------------------------------------------------------------
+// fPdDate: espelha pd.to_datetime(errors='coerce') p/ formatos do feed
+// (usado em keep_last_version L1225 e SplitApplyDate L1614-1616 / L2195).
+// Ordem: ISO compacto, ISO, US, timestamp ISO.
+SET fPdDate = Alt(Date#(Trim(Text($1)),'YYYYMMDD'), Date#(Trim(Text($1)),'YYYY-MM-DD'), Date#(Trim(Text($1)),'MM/DD/YYYY'), Date#(Trim(Text($1)),'M/D/YYYY'), Timestamp#(Trim(Text($1)),'YYYY-MM-DD hh:mm:ss'), Timestamp#(Trim(Text($1)),'YYYY-MM-DD hh:mm:ss.fff'), Date#(Trim(Text($1)),'YYYY/MM/DD'));
+
+// ---------------------------------------------------------------------------
+// SUB ParseDateColumn: espelha parse_date_to_datetime (L530-642) — parser custom.
+// Cria pOut (data numérica Qlik; null se não parseável) a partir de pIn em pTable.
+// ORDEM EXATA do Python:
+//   (0) vazio/nan/nat/none/null -> null
+//   (1) string inteira pura (com .0+ opcional) -> SERIAL EXCEL (base 1899-12-30 ==
+//       serial nativo do Qlik). QUIRK FIEL: '261030' vira ano 2614; serial acima de
+//       9999-12-31 (2958465) estoura datetime no Python -> None -> segue adiante.
+//   (2) dígitos compactos: 8 díg. começando 19/20 -> YYYYMMDD; senão MMDDYYYY vs
+//       DDMMYYYY (a>12 => DMY; b>12 => MDY; senão MDY; senão 1º válido);
+//       6 díg.: MMDDYY vs DDMMYY vs YYMMDD, pivô de século <=79 => 20xx.
+//   (3) 3 partes separadas por / - . : 1ª com 4 díg. -> Y/M/D; 3ª com 4 díg. ->
+//       MDY vs DMY (mesma desambiguação); 3ª com 2 díg. -> idem com pivô.
+//   (4) fallback estilo dateutil (MDY default) p/ formatos restantes comuns.
+// Entrada já numérica (célula de data do Excel) -> usa o serial diretamente
+// (equivale ao Python parsear str(datetime) ISO do pandas).
+// ---------------------------------------------------------------------------
+// Monta em pOutVar a lista Text([c]) as [c] de um arquivo, para ler tudo como texto.
+SUB BuildTextSel(pFile, pSpec, pOutVar)
+  LET $(pOutVar) = '';
+  __probe: FIRST 1 LOAD * FROM [$(pFile)] ($(pSpec));
+  FOR _bi = 1 to Alt(NoOfFields('__probe'), 0)
+    LET _bf = FieldName($(_bi), '__probe');
+    LET $(pOutVar) = If(Len('$($(pOutVar))')>0, '$($(pOutVar)), ', '') & 'Text([$(_bf)]) as [$(_bf)]';
+  NEXT _bi
+  IF Alt(TableNumber('__probe'), -1) >= 0 THEN
+    DROP TABLE __probe;
+  END IF
+END SUB
+
+SUB ParseDateColumn(pTable, pIn, pOut)
+  [__pd_tmp]:
+  LOAD *,
+       If(__pd_isnum=1, __pd_rawnum,
+          If(__pd_nan=1, Null(),
+             Alt(__pd_serial, __pd_c8, __pd_c6, __pd_sep, __pd_fb))) AS [$(pOut)];
+  LOAD *,
+       // (4) fallback dateutil-like
+       Alt(Floor(Timestamp#(__pd_s,'YYYY-MM-DD hh:mm:ss')) + Frac(Timestamp#(__pd_s,'YYYY-MM-DD hh:mm:ss')),
+           Timestamp#(__pd_s,'YYYY-MM-DD hh:mm:ss.ffffff'),
+           Date#(__pd_s,'MMM D YYYY'), Date#(__pd_s,'D MMM YYYY'), Date#(__pd_s,'MMMM D, YYYY'),
+           Timestamp#(__pd_s,'M/D/YYYY h:mm:ss'), Timestamp#(__pd_s,'M/D/YYYY h:mm'),
+           Date#(__pd_s,'DD-MMM-YY'), Date#(__pd_s,'DD-MMM-YYYY')) AS __pd_fb;
+  LOAD *,
+       // (3) separadores: exatamente 3 partes numéricas de 1-4 dígitos
+       If(__pd_p_ok=1,
+          If(Len(__pd_p1)=4,
+             Date#(Num(Num#(__pd_p2),'00')&'/'&Num(Num#(__pd_p3),'00')&'/'&__pd_p1,'MM/DD/YYYY'),
+          If(Len(__pd_p3)=4,
+             If(Num#(__pd_p1)>12 and Num#(__pd_p2)<=12 and Len(Date#(Num(Num#(__pd_p2),'00')&'/'&Num(Num#(__pd_p1),'00')&'/'&__pd_p3,'MM/DD/YYYY'))>0,
+                Date#(Num(Num#(__pd_p2),'00')&'/'&Num(Num#(__pd_p1),'00')&'/'&__pd_p3,'MM/DD/YYYY'),
+             If(Num#(__pd_p2)>12 and Num#(__pd_p1)<=12 and Len(Date#(Num(Num#(__pd_p1),'00')&'/'&Num(Num#(__pd_p2),'00')&'/'&__pd_p3,'MM/DD/YYYY'))>0,
+                Date#(Num(Num#(__pd_p1),'00')&'/'&Num(Num#(__pd_p2),'00')&'/'&__pd_p3,'MM/DD/YYYY'),
+                Alt(Date#(Num(Num#(__pd_p1),'00')&'/'&Num(Num#(__pd_p2),'00')&'/'&__pd_p3,'MM/DD/YYYY'),
+                    Date#(Num(Num#(__pd_p2),'00')&'/'&Num(Num#(__pd_p1),'00')&'/'&__pd_p3,'MM/DD/YYYY')))),
+          If(Len(__pd_p3)=2,
+             If(Num#(__pd_p1)>12 and Num#(__pd_p2)<=12 and Len(Date#(Num(Num#(__pd_p2),'00')&'/'&Num(Num#(__pd_p1),'00')&'/'&Text(If(Num#(__pd_p3)<=79,2000,1900)+Num#(__pd_p3)),'MM/DD/YYYY'))>0,
+                Date#(Num(Num#(__pd_p2),'00')&'/'&Num(Num#(__pd_p1),'00')&'/'&Text(If(Num#(__pd_p3)<=79,2000,1900)+Num#(__pd_p3)),'MM/DD/YYYY'),
+             If(Num#(__pd_p2)>12 and Num#(__pd_p1)<=12 and Len(Date#(Num(Num#(__pd_p1),'00')&'/'&Num(Num#(__pd_p2),'00')&'/'&Text(If(Num#(__pd_p3)<=79,2000,1900)+Num#(__pd_p3)),'MM/DD/YYYY'))>0,
+                Date#(Num(Num#(__pd_p1),'00')&'/'&Num(Num#(__pd_p2),'00')&'/'&Text(If(Num#(__pd_p3)<=79,2000,1900)+Num#(__pd_p3)),'MM/DD/YYYY'),
+                Alt(Date#(Num(Num#(__pd_p1),'00')&'/'&Num(Num#(__pd_p2),'00')&'/'&Text(If(Num#(__pd_p3)<=79,2000,1900)+Num#(__pd_p3)),'MM/DD/YYYY'),
+                    Date#(Num(Num#(__pd_p2),'00')&'/'&Num(Num#(__pd_p1),'00')&'/'&Text(If(Num#(__pd_p3)<=79,2000,1900)+Num#(__pd_p3)),'MM/DD/YYYY')))))))) AS __pd_sep;
+  LOAD *,
+       If(SubStringCount(__pd_sx,'/')=2
+          and Len(__pd_p1)>0 and Len(__pd_p1)<=4 and Len(KeepChar(__pd_p1,'0123456789'))=Len(__pd_p1)
+          and Len(__pd_p2)>0 and Len(__pd_p2)<=4 and Len(KeepChar(__pd_p2,'0123456789'))=Len(__pd_p2)
+          and Len(__pd_p3)>0 and Len(__pd_p3)<=4 and Len(KeepChar(__pd_p3,'0123456789'))=Len(__pd_p3), 1, 0) AS __pd_p_ok;
+  LOAD *,
+       SubField(__pd_sx,'/',1) AS __pd_p1,
+       SubField(__pd_sx,'/',2) AS __pd_p2,
+       SubField(__pd_sx,'/',3) AS __pd_p3;
+  LOAD *,
+       Replace(Replace(__pd_s,'-','/'),'.','/') AS __pd_sx,
+       // (2) compactos
+       If(Len(__pd_dg)=8,
+          If(Match(Left(__pd_dg,2),'19','20')>0 and Len(Date#(__pd_dg,'YYYYMMDD'))>0, Date#(__pd_dg,'YYYYMMDD'),
+          If(Num#(Left(__pd_dg,2))>12 and Num#(Mid(__pd_dg,3,2))<=12 and Len(Date#(Mid(__pd_dg,3,2)&'/'&Left(__pd_dg,2)&'/'&Right(__pd_dg,4),'MM/DD/YYYY'))>0,
+             Date#(Mid(__pd_dg,3,2)&'/'&Left(__pd_dg,2)&'/'&Right(__pd_dg,4),'MM/DD/YYYY'),
+          If(Num#(Mid(__pd_dg,3,2))>12 and Num#(Left(__pd_dg,2))<=12 and Len(Date#(Left(__pd_dg,2)&'/'&Mid(__pd_dg,3,2)&'/'&Right(__pd_dg,4),'MM/DD/YYYY'))>0,
+             Date#(Left(__pd_dg,2)&'/'&Mid(__pd_dg,3,2)&'/'&Right(__pd_dg,4),'MM/DD/YYYY'),
+             Alt(Date#(Left(__pd_dg,2)&'/'&Mid(__pd_dg,3,2)&'/'&Right(__pd_dg,4),'MM/DD/YYYY'),
+                 Date#(Mid(__pd_dg,3,2)&'/'&Left(__pd_dg,2)&'/'&Right(__pd_dg,4),'MM/DD/YYYY')))))) AS __pd_c8,
+       If(Len(__pd_dg)=6,
+          If(Num#(Left(__pd_dg,2))>12 and Num#(Mid(__pd_dg,3,2))<=12 and Len(Date#(Mid(__pd_dg,3,2)&'/'&Left(__pd_dg,2)&'/'&Text(If(Num#(Right(__pd_dg,2))<=79,2000,1900)+Num#(Right(__pd_dg,2))),'MM/DD/YYYY'))>0,
+             Date#(Mid(__pd_dg,3,2)&'/'&Left(__pd_dg,2)&'/'&Text(If(Num#(Right(__pd_dg,2))<=79,2000,1900)+Num#(Right(__pd_dg,2))),'MM/DD/YYYY'),
+          If(Num#(Mid(__pd_dg,3,2))>12 and Num#(Left(__pd_dg,2))<=12 and Len(Date#(Left(__pd_dg,2)&'/'&Mid(__pd_dg,3,2)&'/'&Text(If(Num#(Right(__pd_dg,2))<=79,2000,1900)+Num#(Right(__pd_dg,2))),'MM/DD/YYYY'))>0,
+             Date#(Left(__pd_dg,2)&'/'&Mid(__pd_dg,3,2)&'/'&Text(If(Num#(Right(__pd_dg,2))<=79,2000,1900)+Num#(Right(__pd_dg,2))),'MM/DD/YYYY'),
+             Alt(Date#(Left(__pd_dg,2)&'/'&Mid(__pd_dg,3,2)&'/'&Text(If(Num#(Right(__pd_dg,2))<=79,2000,1900)+Num#(Right(__pd_dg,2))),'MM/DD/YYYY'),
+                 Date#(Mid(__pd_dg,3,2)&'/'&Left(__pd_dg,2)&'/'&Text(If(Num#(Right(__pd_dg,2))<=79,2000,1900)+Num#(Right(__pd_dg,2))),'MM/DD/YYYY'),
+                 Date#(Mid(__pd_dg,3,2)&'/'&Right(__pd_dg,2)&'/'&Text(If(Num#(Left(__pd_dg,2))<=79,2000,1900)+Num#(Left(__pd_dg,2))),'MM/DD/YYYY'))))) AS __pd_c6;
+  LOAD *,
+       KeepChar(__pd_s,'0123456789') AS __pd_dg,
+       // (1) serial excel: inteiro puro (sinal opcional, sufixo .0+ opcional), >0, <=2958465
+       If(Len(__pd_core)>0
+          and Len(KeepChar(__pd_core,'0123456789'))=Len(__pd_core)
+          and Num#(__pd_sgn & __pd_core) > 0
+          and Num#(__pd_sgn & __pd_core) <= 2958465,
+          Num#(__pd_sgn & __pd_core)) AS __pd_serial;
+  LOAD *,
+       // separa sinal e remove sufixo .0+ se existir (regex [+-]?\d+(\.0+)?)
+       If(Left(__pd_s,1)='-','-','') AS __pd_sgn,
+       If(SubStringCount(__pd_sr,'.')=1
+          and Len(SubField(__pd_sr,'.',2))>0 and Len(PurgeChar(SubField(__pd_sr,'.',2),'0'))=0
+          and Len(KeepChar(SubField(__pd_sr,'.',1),'0123456789'))=Len(SubField(__pd_sr,'.',1)),
+          SubField(__pd_sr,'.',1),
+          If(SubStringCount(__pd_sr,'.')=0, __pd_sr, '§NOTINT§')) AS __pd_core;
+  LOAD *,
+       If(Match(Left(__pd_s,1),'+','-')>0, Mid(__pd_s,2), __pd_s) AS __pd_sr;
+  LOAD *,
+       If(Len(Trim(__pd_s0))=0 or Match(Lower(Trim(__pd_s0)),'nan','nat','none','null')>0, 1, 0) AS __pd_nan,
+       // limpeza do Python: nbsp->' ', zwsp/ufffd removidos, strip de aspas, \ -> /, \s+ -> ' '
+       Trim(Replace(Replace(Replace(Replace(Replace(Replace(Replace(Replace(PurgeChar(Replace(__pd_s0, Chr(160),' '), Chr(8203)&Chr(65533)), '\','/'), Chr(9),' '), Chr(10),' '), Chr(13),' '), '  ',' '), '  ',' '), '  ',' '), '  ',' ')) AS __pd_s;
+  LOAD *,
+       // só serial válido: IsNum aceita texto numérico, e '20261028' viraria o ano 57000
+       If(IsNum([$(pIn)]) and Len(Text([$(pIn)]))>0 and Num([$(pIn)])>0 and Num([$(pIn)])<=2958465, 1, 0) AS __pd_isnum,
+       If(IsNum([$(pIn)]), Num([$(pIn)])) AS __pd_rawnum,
+       // strip de aspas externas como no Python: s.strip().strip('"').strip("'")
+       Trim(PurgeChar(Trim(Text([$(pIn)])), '"' & Chr(39))) AS __pd_s0
+  RESIDENT [$(pTable)];
+  DROP TABLE [$(pTable)];
+  RENAME TABLE [__pd_tmp] TO [$(pTable)];
+  DROP FIELDS __pd_isnum, __pd_rawnum, __pd_s0, __pd_nan, __pd_s, __pd_sr, __pd_sgn, __pd_core,
+              __pd_serial, __pd_dg, __pd_c8, __pd_c6, __pd_sx, __pd_p1, __pd_p2, __pd_p3, __pd_p_ok,
+              __pd_sep, __pd_fb FROM [$(pTable)];
+END SUB
+
+// ---------------------------------------------------------------------------
+// SUB ParseCostColumn: espelha parse_cost_original_to_float (L814-880).
+//   1,234.56 | 1.234,56 | (123.45) | sinais | símbolos | quirks:
+//   '1,234'(frac=3,int<=3) -> 1.234 ; >1 vírgula -> milhar ; >1 ponto -> último é decimal.
+// Cria pOut numérico (null se não-conversível) em pTable a partir de pIn.
+// ---------------------------------------------------------------------------
+SUB ParseCostColumn(pTable, pIn, pOut)
+  [__pc_tmp]:
+  LOAD *,
+       If(__pc_bad=1, Null(), If(__pc_neg=1, -Fabs(__pc_v), __pc_v)) AS [$(pOut)];
+  LOAD *,
+       If(Len(__pc_s4)=0 or IsNull(Num#(__pc_s4,'0.##########','.',',')), 1, 0) AS __pc_bad,
+       Num#(__pc_s4,'0.##########','.',',') AS __pc_v;
+  LOAD *,
+       // desambiguação decimal (ordem idêntica ao Python)
+       If(Index(__pc_s3,'.')>0 and Index(__pc_s3,',')>0,
+          If(Index(__pc_s3,'.',-1) > Index(__pc_s3,',',-1), Replace(__pc_s3,',',''),
+             Replace(Replace(__pc_s3,'.',''),',','.')),
+       If(Index(__pc_s3,',')>0 and Index(__pc_s3,'.')=0,
+          If(SubStringCount(__pc_s3,',')>1, Replace(__pc_s3,',',''),
+             If(Len(SubField(__pc_s3,',',2))>=1 and Len(SubField(__pc_s3,',',2))<=2, Replace(__pc_s3,',','.'),
+             If(Len(SubField(__pc_s3,',',2))=3,
+                If(Len(SubField(__pc_s3,',',1))<=3, Replace(__pc_s3,',','.'), Replace(__pc_s3,',','')),
+                Replace(__pc_s3,',','')))),
+       If(Index(__pc_s3,'.')>0 and Index(__pc_s3,',')=0 and SubStringCount(__pc_s3,'.')>1,
+          Replace(Left(__pc_s3, Index(__pc_s3,'.',-1)-1),'.','') & '.' & Mid(__pc_s3, Index(__pc_s3,'.',-1)+1),
+          __pc_s3))) AS __pc_s4;
+  LOAD *,
+       Replace(Replace(__pc_s2c,'+',''),'-','') AS __pc_s3,
+       If(__pc_neg0=1 or Left(__pc_s2c,1)='-', 1, 0) AS __pc_neg;
+  LOAD *,
+       If(Left(__pc_s2b,1)='+', Mid(__pc_s2b,2), __pc_s2b) AS __pc_s2c;
+  LOAD *,
+       If((Index(__pc_s2a,'(')>0) = (Index(__pc_s2a,')')>0), Trim(Replace(Replace(__pc_s2a,'(',''),')','')), '') AS __pc_s2b,
+       If(Index(__pc_s2a,'(')>0 and Index(__pc_s2a,')')>0, 1, 0) AS __pc_neg0;
+  LOAD *,
+       KeepChar(__pc_s1, '0123456789.,-+()') AS __pc_s2a;
+  LOAD *,
+       If(Len(Trim(Text([$(pIn)])))=0 or Lower(Trim(Text([$(pIn)])))='nan', '',
+          Replace(Trim(Text([$(pIn)])), Chr(160), ' ')) AS __pc_s1
+  RESIDENT [$(pTable)];
+  DROP TABLE [$(pTable)];
+  RENAME TABLE [__pc_tmp] TO [$(pTable)];
+  DROP FIELDS __pc_s1, __pc_s2a, __pc_s2b, __pc_s2c, __pc_neg0, __pc_s3, __pc_neg, __pc_s4, __pc_bad, __pc_v FROM [$(pTable)];
+END SUB
+
+// parse_split_to_0_1 (L779-811): 0.25 | 25% | 25 | 0,25 | '25 %'
+// %, ou valor >1 => /100 ; fora de [0,1] => null
+SET fParseSplit = If(Len(Trim(Text($1)))=0 or Lower(Trim(Text($1)))='nan', Null(),
+  If(IsNull(Num#(KeepChar(Replace(Replace(PurgeChar(Replace(Text($1),Chr(160),' '),' '&Chr(9)&Chr(10)&Chr(13)),'%',''),',','.'),'0123456789.-'),'0.##########','.',',')), Null(),
+  If( (If(Index(PurgeChar(Replace(Text($1),Chr(160),' '),' '&Chr(9)&Chr(10)&Chr(13)),'%')>0, 1, 0)=1
+       or Num#(KeepChar(Replace(Replace(PurgeChar(Replace(Text($1),Chr(160),' '),' '&Chr(9)&Chr(10)&Chr(13)),'%',''),',','.'),'0123456789.-'),'0.##########','.',',')>1),
+      If(Num#(KeepChar(Replace(Replace(PurgeChar(Replace(Text($1),Chr(160),' '),' '&Chr(9)&Chr(10)&Chr(13)),'%',''),',','.'),'0123456789.-'),'0.##########','.',',')/100 < 0
+         or Num#(KeepChar(Replace(Replace(PurgeChar(Replace(Text($1),Chr(160),' '),' '&Chr(9)&Chr(10)&Chr(13)),'%',''),',','.'),'0123456789.-'),'0.##########','.',',')/100 > 1, Null(),
+         Num#(KeepChar(Replace(Replace(PurgeChar(Replace(Text($1),Chr(160),' '),' '&Chr(9)&Chr(10)&Chr(13)),'%',''),',','.'),'0123456789.-'),'0.##########','.',',')/100),
+      If(Num#(KeepChar(Replace(Replace(PurgeChar(Replace(Text($1),Chr(160),' '),' '&Chr(9)&Chr(10)&Chr(13)),'%',''),',','.'),'0123456789.-'),'0.##########','.',',')<0
+         or Num#(KeepChar(Replace(Replace(PurgeChar(Replace(Text($1),Chr(160),' '),' '&Chr(9)&Chr(10)&Chr(13)),'%',''),',','.'),'0123456789.-'),'0.##########','.',',')>1, Null(),
+         Num#(KeepChar(Replace(Replace(PurgeChar(Replace(Text($1),Chr(160),' '),' '&Chr(9)&Chr(10)&Chr(13)),'%',''),',','.'),'0123456789.-'),'0.##########','.',',')))));
+
+// GLCS — _normalise_numeric_account_for_lookup (L2809-2830):
+// tira apóstrofo/aspas/artefato .0 ; se tiver LETRA -> '' ; senão só dígitos
+SET fAcctClean = If(Len(Trim(Text($1)))=0 or Match(Lower(Trim(Text($1))),'nan','none','null','nat')>0, '',
+                    Trim(PurgeChar(Trim(Replace(Replace(Replace(Text($1),Chr(160),' '),Chr(8203),''),Chr(65279),'')), '"'&Chr(39))));
+// SUB NormAcctColumns: cria pOutBase (dígitos; '' se contém letra) e pOutNoZ
+// (sem zeros à esquerda; '0' se tudo zero — lstrip('0') or '0' do Python) em pTable.
+// Espelha _normalise_numeric_account_for_lookup + _numeric_account_lookup_variants
+// (L2809-2841): artefato '\d+\.0+' perde o sufixo; demais não-dígitos são removidos
+// (ex.: '12345.50' -> '1234550', fiel ao re.sub(r'\D','') do Python).
+SUB NormAcctColumns(pTable, pIn, pOutBase, pOutNoZ)
+  [__na_tmp]:
+  LOAD *,
+       If(Len(__na_base)=0, '',
+          If(FindOneOf(__na_base,'123456789')=0, '0', Mid(__na_base, FindOneOf(__na_base,'123456789')))) AS [$(pOutNoZ)];
+  LOAD *,
+       If(Len(__na_c)=0 or Len(KeepChar(Upper(__na_c),'ABCDEFGHIJKLMNOPQRSTUVWXYZ'))>0, '',
+          KeepChar(
+            If(SubStringCount(__na_c,'.')=1
+               and Len(SubField(__na_c,'.',1))>0
+               and Len(KeepChar(SubField(__na_c,'.',1),'0123456789'))=Len(SubField(__na_c,'.',1))
+               and Len(SubField(__na_c,'.',2))>0
+               and Len(PurgeChar(SubField(__na_c,'.',2),'0'))=0,
+               SubField(__na_c,'.',1), __na_c),
+            '0123456789')) AS __na_base;
+  LOAD *,
+       If(Len(Trim(Text([$(pIn)])))=0 or Match(Lower(Trim(Text([$(pIn)]))),'nan','none','null','nat')>0, '',
+          Trim(PurgeChar(Trim(Replace(Replace(Replace(Text([$(pIn)]),Chr(160),' '),Chr(8203),''),Chr(65279),'')), '"'&Chr(39)))) AS __na_c
+  RESIDENT [$(pTable)];
+  DROP TABLE [$(pTable)];
+  RENAME TABLE [__na_tmp] TO [$(pTable)];
+  RENAME FIELD __na_base TO [$(pOutBase)];
+  DROP FIELDS __na_c FROM [$(pTable)];
+END SUB
+
+// token_to_date (L372-404): 8 díg. '20'->YYYYMMDD ; 8 díg. '26'->tira 26 e YYMMDD ; 6 díg.->20YY MMDD
+SET fTokenToDate = If(Len(KeepChar(Text($1),'0123456789'))=8 and Left(KeepChar(Text($1),'0123456789'),2)='20',
+                      Date#(KeepChar(Text($1),'0123456789'),'YYYYMMDD'),
+                   If(Len(KeepChar(Text($1),'0123456789'))=8 and Left(KeepChar(Text($1),'0123456789'),2)='26',
+                      Date#('20' & Mid(KeepChar(Text($1),'0123456789'),3),'YYYYMMDD'),
+                   If(Len(KeepChar(Text($1),'0123456789'))=6,
+                      Date#('20' & KeepChar(Text($1),'0123456789'),'YYYYMMDD'), Null())));
+
+// --- XML -------------------------------------------------------------------
+// A extração textual dos TradeFeeds (preservando a ORDEM DO DOCUMENTO, que o
+// XmlSimple perde) é implementada na seção 03 via tabelas de ocorrências
+// (While/IterNo), sem funções-variável aninhadas. Regras espelhadas:
+//   find_first_text_by_local_name (L335-353)  -> 1ª ocorrência NÃO-VAZIA na árvore
+//   _dfs_find_first_cost_excluding_branches   -> 1º <Cost> não-vazio FORA de TransactionCosts
+//   extract_transaction_cost_items (L928-988) -> Code 'R' ANTES do 1º Cost não-vazio = AddOn
+//   parse_tradefeed_to_row (L1087-1132)       -> campos do Common: ÚLTIMA ocorrência vence
+//                                                (mesmo vazia); Salesperson: 1º alias não-vazio.
+
+///$tab 02 — Descoberta XML & Data Payout
+// ============================================================================
+// 02 — DESCOBERTA DOS XML + DATA DO PAYOUT
+// Espelha: discover_files (L1916-1936), extract_file_date_token (L356-369),
+//          token_to_date (L372-404), previous_business_day (L407-411),
+//          determine_output_yyyymmdd_from_files (L414-432).
+// ============================================================================
+// Config do envelope XML (ajustar UMA vez após inspecionar um arquivo real):
+SET vXmlFeedOpen  = '<TradeFeed>';     // tag de abertura EXATA do TradeFeed
+SET vXmlFeedClose = '</TradeFeed>';    // tag de fechamento EXATA
+
+// SUB ExtractFileToken: espelha extract_file_date_token (L356-369).
+//   regex1: \.(\d{6,8})\.4$  -> penúltimo campo separado por '.' se for 6-8 dígitos
+//   regex2: \b(\d{6,8})\b    -> primeira RUN de dígitos de comprimento 6-8
+// Resultado em vToken ('' se nenhum).
+SUB ExtractFileToken(pName)
+  LET vToken = '';
+  LET _nParts = SubStringCount('$(pName)', '.') + 1;
+  IF Right('$(pName)', 2) = '.4' and $(_nParts) >= 3 THEN
+    LET _cand = SubField('$(pName)', '.', $(_nParts) - 1);
+    IF Len('$(_cand)') >= 6 and Len('$(_cand)') <= 8 and Len(KeepChar('$(_cand)', '0123456789')) = Len('$(_cand)') THEN
+      LET vToken = '$(_cand)';
+    END IF
+  END IF
+  IF Len('$(vToken)') = 0 THEN
+    LET _run = '';
+    FOR _i = 1 to Len('$(pName)') + 1
+      LET _ch = Mid('$(pName)', $(_i), 1);
+      IF Len('$(_ch)') > 0 and Index('0123456789', '$(_ch)') > 0 THEN
+        LET _run = '$(_run)$(_ch)';
+      ELSE
+        IF Len('$(_run)') >= 6 and Len('$(_run)') <= 8 THEN
+          LET vToken = '$(_run)';
+          EXIT FOR
+        END IF
+        LET _run = '';
+      END IF
+    NEXT _i
+  END IF
+  LET _nParts =; LET _cand =; LET _run =; LET _i =; LET _ch =;
+END SUB
+
+// --- lista de arquivos (glob + sufixo .4 + filtro date_limit_token) ---------
+// sentinela -1 = "sem data" (evita expansão $() vazia em expressões)
+LET vLimitDateNum = Alt(If(Len('$(vDateLimitToken)')>0, Num($(fTokenToDate(vDateLimitToken)))), -1);
+
+FOR Each _vF in FileList('$(vLibXML)$(vXmlPattern)')
+  LET _vBase = SubField(SubField('$(_vF)','\',-1),'/',-1);
+  IF Right('$(_vBase)', 2) = '.4' THEN                       // L1922: só .4
+    CALL ExtractFileToken('$(_vBase)');                       // -> vToken
+    LET _vTokDate = Alt(Num($(fTokenToDate(vToken))), -1);
+    // L1924-1934: com limite, mantém tok_dt NULO ou tok_dt <= limite (fiel!)
+    IF $(vLimitDateNum) = -1 or $(_vTokDate) = -1 or $(_vTokDate) <= $(vLimitDateNum) THEN
+      IF Alt(TableNumber('XML_FILES'), -1) < 0 THEN
+        XML_FILES:
+        LOAD '$(_vF)' as file_path, '$(_vBase)' as file_name,
+             '$(vToken)' as file_date_token,
+             If($(_vTokDate) <> -1, $(_vTokDate), Null()) as token_date_num
+        AUTOGENERATE 1;
+      ELSE
+        Concatenate(XML_FILES)
+        LOAD '$(_vF)' as file_path, '$(_vBase)' as file_name,
+             '$(vToken)' as file_date_token,
+             If($(_vTokDate) <> -1, $(_vTokDate), Null()) as token_date_num
+        AUTOGENERATE 1;
+      END IF
+    END IF
+  END IF
+NEXT _vF
+
+LET vNumXmlFiles = If(Alt(TableNumber('XML_FILES'),-1) < 0, 0, NoOfRows('XML_FILES'));
+// Python: sorted(matches) — ordena por caminho completo (L1936)
+IF $(vNumXmlFiles) > 0 THEN
+  _XML_FILES_SORTED: NoConcatenate LOAD * RESIDENT XML_FILES ORDER BY file_path ASC;
+  DROP TABLE XML_FILES; RENAME TABLE _XML_FILES_SORTED TO XML_FILES;
+END IF
+TRACE [CASTINE] Arquivos XML descobertos: $(vNumXmlFiles);
+IF $(vNumXmlFiles) = 0 THEN
+  TRACE [CASTINE][EXIT] No Bloomberg XML files found. (main L3413-3415);
+  // Não declara sucesso: aborta com erro explícito
+  CALL AbortNoFiles_UndefinedSub_ForcesScriptError;
+END IF
+
+// determine_output_yyyymmdd_from_files (L414-432): data = MAX token_date;
+// fallback = dia útil anterior a hoje (sem feriados — fiel ao Python L407-411)
+_TMPMAX: LOAD Max(token_date_num) as _maxd RESIDENT XML_FILES;
+LET vPayoutDateNum = Peek('_maxd', 0, '_TMPMAX');
+DROP TABLE _TMPMAX;
+IF Len('$(vPayoutDateNum)') = 0 THEN
+  LET vPayoutDateNum = Num(Today()) - 1;
+  DO WHILE Mod($(vPayoutDateNum) + 5, 7) >= 5   // weekday() Python: Mon=0..Sun=6
+    LET vPayoutDateNum = $(vPayoutDateNum) - 1;
+  LOOP
+  TRACE [CASTINE][WARN] Token-based date unavailable. Using previous business day.;
+END IF
+LET vPayoutYYYYMMDD = Date($(vPayoutDateNum), 'YYYYMMDD');
+LET vPayoutDateDDMMYYYY = Date($(vPayoutDateNum), 'DDMMYYYY');
+TRACE [CASTINE] Payout date: $(vPayoutYYYYMMDD);
+
+///$tab 03 — Leitura Bloomberg XML
+// ============================================================================
+// 03 — PARSE TEXTUAL DOS TRADEFEEDS (ordem do documento preservada)
+// Espelha parse_file_to_temp_csv/iterparse (L1135-1193) + parse_tradefeed_to_row
+// (L1087-1132) + extração de custos (L899-1050).
+// Por que textual e não XmlSimple: as regras do Python dependem da ORDEM dos nós
+// (1º Cost fora de TransactionCosts; Code 'R' ANTES do Cost no MESMO
+// TransactionCost; 1º MasterAccountName não-vazio da árvore) — o XmlSimple
+// descarta a ordem relativa entre tags irmãs de nomes diferentes.
+// Premissas documentadas (ver 03_BLOOMBERG_XML_MAPPING.md): tags sem namespace
+// e sem atributos (exceto Field name=...); <TransactionCosts> aparece no máx.
+// 1x por feed (auditado em AUDIT_XML_SCAN); aliases de Salesperson em ordem de
+// preferência fixa (auditado quando houver 2+ aliases distintos preenchidos).
+// ============================================================================
+
+// O parser XML do Python decodifica entidades; a leitura textual precisa fazer isso.
+// O pd.read_csv do temporário (L3454) transforma estes textos em vazio; o sentinela
+// (VAZIO) existe porque INLINE não carrega string vazia.
+MapPandasNA:
+Mapping LOAD * INLINE [
+__k|__v
+#N/A|(VAZIO)
+#N/A N/A|(VAZIO)
+#NA|(VAZIO)
+-1.#IND|(VAZIO)
+-1.#QNAN|(VAZIO)
+-NaN|(VAZIO)
+-nan|(VAZIO)
+1.#IND|(VAZIO)
+1.#QNAN|(VAZIO)
+<NA>|(VAZIO)
+N/A|(VAZIO)
+NA|(VAZIO)
+NULL|(VAZIO)
+NaN|(VAZIO)
+None|(VAZIO)
+n/a|(VAZIO)
+nan|(VAZIO)
+null|(VAZIO)
+] (delimiter is '|');
+SET fXmlDec = Replace(Replace(Replace(Replace(Replace($1 & '', '&lt;','<'), '&gt;','>'), '&quot;','"'), '&apos;',Chr(39)), '&amp;','&');
+SET fXmlVal = Replace(ApplyMap('MapPandasNA', $(fXmlDec($1)), $(fXmlDec($1))), '(VAZIO)', '');
+
+FOR _i = 0 to NoOfRows('XML_FILES') - 1
+  LET _vF   = Peek('file_path', $(_i), 'XML_FILES');
+  LET _vB   = Peek('file_name', $(_i), 'XML_FILES');
+  LET _vTok = Peek('file_date_token', $(_i), 'XML_FILES');
+  IF Alt(TableNumber('_XMLLINES'), -1) < 0 THEN
+    _XMLLINES:
+    LOAD '$(_vB)' as file_name, '$(_vTok)' as file_date_token,
+         RecNo() as line_no, @1:n as Line
+    FROM [$(_vF)] (fix, codepage is 65001);
+  ELSE
+    Concatenate(_XMLLINES)
+    LOAD '$(_vB)' as file_name, '$(_vTok)' as file_date_token,
+         RecNo() as line_no, @1:n as Line
+    FROM [$(_vF)] (fix, codepage is 65001);
+  END IF
+NEXT _i
+
+_XMLBLOB:
+LOAD file_name, file_date_token,
+     Concat(Line, Chr(10), line_no) as blob
+RESIDENT _XMLLINES
+GROUP BY file_name, file_date_token;
+DROP TABLE _XMLLINES;
+
+// ---- um registro por TradeFeed (ordem do arquivo preservada por feed_no) ----
+_FEEDS:
+LOAD file_name as source_file,
+     file_date_token,
+     IterNo() as feed_no,
+     TextBetween(blob, '$(vXmlFeedOpen)', '$(vXmlFeedClose)', IterNo()) as feed_blob
+RESIDENT _XMLBLOB
+WHILE IterNo() <= SubStringCount(blob, '$(vXmlFeedClose)');
+DROP TABLE _XMLBLOB;
+
+LET vTotalTradesParsed = NoOfRows('_FEEDS');
+TRACE [CASTINE] total_trades_parsed_raw: $(vTotalTradesParsed);
+IF $(vTotalTradesParsed) = 0 THEN
+  TRACE [CASTINE][EXIT] Parsed 0 trades. Check XML inputs. (main L3446-3449);
+  CALL AbortNoTrades_UndefinedSub_ForcesScriptError;
+END IF
+
+// ---- TransactionCost: 1 linha por item, com flags de ordem -----------------
+// extract_transaction_cost_items (L928-988): por item, Cost = 1ª ocorrência
+// NÃO-VAZIA; CodeR_before_Cost = existe <Code> com valor 'R' (trim/upper) ANTES
+// do 1º <Cost> não-vazio (ou sem nenhum Cost não-vazio).
+_TXC:
+LOAD '__SEED__' as source_file, 0 as feed_no, 0 as txc_no, '' as txc_blob AUTOGENERATE 1;
+Concatenate(_TXC)
+LOAD source_file, feed_no,
+     IterNo() as txc_no,
+     TextBetween(feed_blob, '<TransactionCost>', '</TransactionCost>', IterNo()) as txc_blob
+RESIDENT _FEEDS
+WHILE IterNo() <= SubStringCount(feed_blob, '</TransactionCost>');
+
+_TXC2:
+LOAD source_file, feed_no, txc_no, txc_blob,
+     // 1ª ocorrência não-vazia de <Cost> e sua posição
+     Alt(If(Len(Trim(TextBetween(txc_blob,'<Cost>','</Cost>',1)))>0, 1),
+         If(Len(Trim(TextBetween(txc_blob,'<Cost>','</Cost>',2)))>0, 2),
+         If(Len(Trim(TextBetween(txc_blob,'<Cost>','</Cost>',3)))>0, 3),
+         If(Len(Trim(TextBetween(txc_blob,'<Cost>','</Cost>',4)))>0, 4)) as _cost_occ,
+     // 1ª ocorrência de <Code> com valor R (trim/upper)
+     Alt(If(Upper(Trim(TextBetween(txc_blob,'<Code>','</Code>',1)))='R', 1),
+         If(Upper(Trim(TextBetween(txc_blob,'<Code>','</Code>',2)))='R', 2),
+         If(Upper(Trim(TextBetween(txc_blob,'<Code>','</Code>',3)))='R', 3),
+         If(Upper(Trim(TextBetween(txc_blob,'<Code>','</Code>',4)))='R', 4)) as _coder_occ
+RESIDENT _TXC;
+DROP TABLE _TXC;
+
+_TXC3:
+LOAD source_file, feed_no, txc_no,
+     If(Len(_cost_occ)>0, Trim(TextBetween(txc_blob,'<Cost>','</Cost>',_cost_occ)), '') as txc_cost_text,
+     If(Len(_cost_occ)>0, Index(txc_blob, '<Cost>', _cost_occ), 0) as _pos_cost,
+     If(Len(_coder_occ)>0, Index(txc_blob, '<Code>', _coder_occ), 0) as _pos_coder,
+     // CodeR_before_Cost: R visto enquanto seen_cost=False (L961-986)
+     If(Len(_coder_occ)>0 and (Len(_cost_occ)=0 or Index(txc_blob,'<Code>',_coder_occ) < Index(txc_blob,'<Cost>',_cost_occ)), 1, 0) as txc_is_addon
+RESIDENT _TXC2;
+DROP TABLE _TXC2;
+
+// parse dos custos dos itens (parse_cost_original_to_float por item — L991-1002)
+CALL ParseCostColumn('_TXC3', 'txc_cost_text', 'txc_cost_num');
+
+// Agregados por feed:
+//  - AddOn: soma dos custos parseáveis dos itens addon; '' se nenhum (L1037-1050);
+//    texto formatado como f'{total:.10f}'.rstrip('0').rstrip('.')
+//  - fallback primário: 1º item NÃO-addon com Cost não-vazio (L1020-1031)
+_TXC_ADDON:
+LOAD source_file, feed_no,
+     If(Count(If(txc_is_addon=1 and Len(txc_cost_text)>0 and Len(txc_cost_num)>0, 1))>0,
+        Num($(fRound10(Sum(txc_is_addon * txc_cost_num))), '0.##########', '.', ','),
+        '') as addon_sum_text,
+     Min(If(txc_is_addon=0 and Len(txc_cost_text)>0, txc_no)) as _first_nonaddon_no
+RESIDENT _TXC3
+GROUP BY source_file, feed_no;
+
+Left Join(_TXC_ADDON)
+LOAD source_file, feed_no, txc_no as _first_nonaddon_no,
+     txc_cost_text as fallback_cost_text
+RESIDENT _TXC3;
+
+// contagem de blocos TransactionCosts por feed (auditoria da premissa <=1)
+_TXCCOUNT:
+LOAD source_file, feed_no,
+     SubStringCount(feed_blob, '<TransactionCosts>') as _n_txcs_blocks
+RESIDENT _FEEDS;
+
+DROP TABLE _TXC3;
+
+// ---- Extração de campos por TradeFeed (PARSED_SCHEMA, L224-250) -------------
+// Campos regulares do Common: a ÚLTIMA ocorrência vence, MESMO VAZIA
+// (parse_tradefeed_to_row L1113-1116 sobrescreve incondicionalmente).
+// Salesperson: 1º alias NÃO-VAZIO (L1107-1111) — ordem de preferência fixa aqui;
+// feeds com 2+ aliases distintos preenchidos são contados em AUDIT_XML_SCAN.
+_PARSED:
+LOAD source_file, file_date_token, feed_no,
+     $(fXmlVal(TransactionNumber)) as TransactionNumber,
+     $(fXmlVal(OriginalTktId)) as OriginalTktId,
+     $(fXmlVal(SecurityIdentifier)) as SecurityIdentifier,
+     $(fXmlVal(SecurityCurrencyISOCode)) as SecurityCurrencyISOCode,
+     $(fXmlVal(Ticker)) as Ticker,
+     $(fXmlVal(MaturityDateExpirationDate)) as MaturityDateExpirationDate,
+     $(fXmlVal(BuySellCoverShortFlag)) as BuySellCoverShortFlag,
+     $(fXmlVal(TradeDate)) as TradeDate,
+     $(fXmlVal(AsOfTradeDate)) as AsOfTradeDate,
+     $(fXmlVal(Price)) as Price,
+     $(fXmlVal(TradeAmount)) as TradeAmount,
+     $(fXmlVal(CustomerAccountCounterparty)) as CustomerAccountCounterparty,
+     $(fXmlVal(AccountCounterpartyShortName)) as AccountCounterpartyShortName,
+     $(fXmlVal(MasterAccountName)) as MasterAccountName,
+     $(fXmlVal(TraderAccountName)) as TraderAccountName,
+     $(fXmlVal(TraderAccountNumber)) as TraderAccountNumber,
+     $(fXmlVal(SalespersonName)) as SalespersonName,
+     $(fXmlVal(TransactionType)) as TransactionType,
+     $(fXmlVal(OMReasonCode)) as OMReasonCode,
+     $(fXmlVal(SECURITY_TYP)) as SECURITY_TYP,
+     $(fXmlVal(MARKET_SECTOR_DES)) as MARKET_SECTOR_DES,
+     __cost_out, __sp_case_risk, __sp_multi_alias, __ext_mixed_attr;
+LOAD source_file, file_date_token, feed_no,
+     TransactionNumber, OriginalTktId, SecurityIdentifier, SecurityCurrencyISOCode,
+     Ticker, MaturityDateExpirationDate, BuySellCoverShortFlag, TradeDate, AsOfTradeDate,
+     Price, TradeAmount, CustomerAccountCounterparty, AccountCounterpartyShortName,
+     If(Len(MasterAccountName)=0, __man_deep, MasterAccountName) as MasterAccountName,  // fallback árvore (L1127-1128)
+     TraderAccountName, TraderAccountNumber, SalespersonName, TransactionType, OMReasonCode,
+     SECURITY_TYP, MARKET_SECTOR_DES,
+     __cost_out,                // custo fora de TransactionCosts (consolidação em _RAW)
+     __sp_case_risk, __sp_multi_alias, __ext_mixed_attr;
+LOAD *,
+     // ExtendedFields: Field name=SECURITY_TYP / MARKET_SECTOR_DES — último nó vence
+     // (iteração L1118-1125 sobrescreve). Variantes de atributo: name/NAME/Name, " e '.
+     If(SubStringCount(__eb,'<Field name="SECURITY_TYP">')>0,
+        Trim(TextBetween(__eb,'<Field name="SECURITY_TYP">','</Field>',SubStringCount(__eb,'<Field name="SECURITY_TYP">'))),
+     If(SubStringCount(__eb,'<Field NAME="SECURITY_TYP">')>0,
+        Trim(TextBetween(__eb,'<Field NAME="SECURITY_TYP">','</Field>',SubStringCount(__eb,'<Field NAME="SECURITY_TYP">'))),
+     If(SubStringCount(__eb,'<Field Name="SECURITY_TYP">')>0,
+        Trim(TextBetween(__eb,'<Field Name="SECURITY_TYP">','</Field>',SubStringCount(__eb,'<Field Name="SECURITY_TYP">'))),
+     If(SubStringCount(__eb,'<Field name=' & Chr(39) & 'SECURITY_TYP' & Chr(39) & '>')>0,
+        Trim(TextBetween(__eb,'<Field name=' & Chr(39) & 'SECURITY_TYP' & Chr(39) & '>','</Field>',SubStringCount(__eb,'<Field name=' & Chr(39) & 'SECURITY_TYP' & Chr(39) & '>'))),
+        '')))) as SECURITY_TYP,
+     If(SubStringCount(__eb,'<Field name="MARKET_SECTOR_DES">')>0,
+        Trim(TextBetween(__eb,'<Field name="MARKET_SECTOR_DES">','</Field>',SubStringCount(__eb,'<Field name="MARKET_SECTOR_DES">'))),
+     If(SubStringCount(__eb,'<Field NAME="MARKET_SECTOR_DES">')>0,
+        Trim(TextBetween(__eb,'<Field NAME="MARKET_SECTOR_DES">','</Field>',SubStringCount(__eb,'<Field NAME="MARKET_SECTOR_DES">'))),
+     If(SubStringCount(__eb,'<Field Name="MARKET_SECTOR_DES">')>0,
+        Trim(TextBetween(__eb,'<Field Name="MARKET_SECTOR_DES">','</Field>',SubStringCount(__eb,'<Field Name="MARKET_SECTOR_DES">'))),
+     If(SubStringCount(__eb,'<Field name=' & Chr(39) & 'MARKET_SECTOR_DES' & Chr(39) & '>')>0,
+        Trim(TextBetween(__eb,'<Field name=' & Chr(39) & 'MARKET_SECTOR_DES' & Chr(39) & '>','</Field>',SubStringCount(__eb,'<Field name=' & Chr(39) & 'MARKET_SECTOR_DES' & Chr(39) & '>'))),
+        '')))) as MARKET_SECTOR_DES,
+     If((If(SubStringCount(__eb,'name="SECURITY_TYP"')>0,1,0) + If(SubStringCount(__eb,'NAME="SECURITY_TYP"')>0,1,0) + If(SubStringCount(__eb,'Name="SECURITY_TYP"')>0,1,0)) > 1, 1, 0) as __ext_mixed_attr,
+     // MasterAccountName profundo: 1ª ocorrência NÃO-VAZIA na árvore inteira (L335-353)
+     If(Len(Trim(TextBetween(feed_blob,'<MasterAccountName>','</MasterAccountName>',1)))>0, Trim(TextBetween(feed_blob,'<MasterAccountName>','</MasterAccountName>',1)), If(Len(Trim(TextBetween(feed_blob,'<MasterAccountName>','</MasterAccountName>',2)))>0, Trim(TextBetween(feed_blob,'<MasterAccountName>','</MasterAccountName>',2)), If(Len(Trim(TextBetween(feed_blob,'<MasterAccountName>','</MasterAccountName>',3)))>0, Trim(TextBetween(feed_blob,'<MasterAccountName>','</MasterAccountName>',3)), If(Len(Trim(TextBetween(feed_blob,'<MasterAccountName>','</MasterAccountName>',4)))>0, Trim(TextBetween(feed_blob,'<MasterAccountName>','</MasterAccountName>',4)), If(Len(Trim(TextBetween(feed_blob,'<MasterAccountName>','</MasterAccountName>',5)))>0, Trim(TextBetween(feed_blob,'<MasterAccountName>','</MasterAccountName>',5)), If(Len(Trim(TextBetween(feed_blob,'<MasterAccountName>','</MasterAccountName>',6)))>0, Trim(TextBetween(feed_blob,'<MasterAccountName>','</MasterAccountName>',6)), If(Len(Trim(TextBetween(feed_blob,'<MasterAccountName>','</MasterAccountName>',7)))>0, Trim(TextBetween(feed_blob,'<MasterAccountName>','</MasterAccountName>',7)), If(Len(Trim(TextBetween(feed_blob,'<MasterAccountName>','</MasterAccountName>',8)))>0, Trim(TextBetween(feed_blob,'<MasterAccountName>','</MasterAccountName>',8)), '')))))))) as __man_deep,
+     // custo fora de TransactionCosts: 1º <Cost> NÃO-VAZIO no feed sem o bloco TXC
+     If(Len(Trim(TextBetween(__wo,'<Cost>','</Cost>',1)))>0, Trim(TextBetween(__wo,'<Cost>','</Cost>',1)), If(Len(Trim(TextBetween(__wo,'<Cost>','</Cost>',2)))>0, Trim(TextBetween(__wo,'<Cost>','</Cost>',2)), If(Len(Trim(TextBetween(__wo,'<Cost>','</Cost>',3)))>0, Trim(TextBetween(__wo,'<Cost>','</Cost>',3)), If(Len(Trim(TextBetween(__wo,'<Cost>','</Cost>',4)))>0, Trim(TextBetween(__wo,'<Cost>','</Cost>',4)), If(Len(Trim(TextBetween(__wo,'<Cost>','</Cost>',5)))>0, Trim(TextBetween(__wo,'<Cost>','</Cost>',5)), If(Len(Trim(TextBetween(__wo,'<Cost>','</Cost>',6)))>0, Trim(TextBetween(__wo,'<Cost>','</Cost>',6)), If(Len(Trim(TextBetween(__wo,'<Cost>','</Cost>',7)))>0, Trim(TextBetween(__wo,'<Cost>','</Cost>',7)), If(Len(Trim(TextBetween(__wo,'<Cost>','</Cost>',8)))>0, Trim(TextBetween(__wo,'<Cost>','</Cost>',8)), '')))))))) as __cost_out;
+LOAD *,
+     // Salesperson: 1º alias não-vazio (até 3 ocorrências por alias)
+     If(Len(Trim(TextBetween(__cb,'<SalespersonName>','</SalespersonName>',1)))>0, Trim(TextBetween(__cb,'<SalespersonName>','</SalespersonName>',1)), If(Len(Trim(TextBetween(__cb,'<SalespersonName>','</SalespersonName>',2)))>0, Trim(TextBetween(__cb,'<SalespersonName>','</SalespersonName>',2)), If(Len(Trim(TextBetween(__cb,'<Salesperson>','</Salesperson>',1)))>0, Trim(TextBetween(__cb,'<Salesperson>','</Salesperson>',1)), If(Len(Trim(TextBetween(__cb,'<Salesperson>','</Salesperson>',2)))>0, Trim(TextBetween(__cb,'<Salesperson>','</Salesperson>',2)), If(Len(Trim(TextBetween(__cb,'<SalespersonFullName>','</SalespersonFullName>',1)))>0, Trim(TextBetween(__cb,'<SalespersonFullName>','</SalespersonFullName>',1)), If(Len(Trim(TextBetween(__cb,'<Salesperson_Name>','</Salesperson_Name>',1)))>0, Trim(TextBetween(__cb,'<Salesperson_Name>','</Salesperson_Name>',1)), If(Len(Trim(TextBetween(__cb,'<Sales_Person_Name>','</Sales_Person_Name>',1)))>0, Trim(TextBetween(__cb,'<Sales_Person_Name>','</Sales_Person_Name>',1)), ''))))))) as SalespersonName,
+     If((If(Len(Trim(TextBetween(__cb,'<SalespersonName>','</SalespersonName>',1)))>0,1,0)
+        +If(Len(Trim(TextBetween(__cb,'<Salesperson>','</Salesperson>',1)))>0,1,0)
+        +If(Len(Trim(TextBetween(__cb,'<SalespersonFullName>','</SalespersonFullName>',1)))>0,1,0)
+        +If(Len(Trim(TextBetween(__cb,'<Salesperson_Name>','</Salesperson_Name>',1)))>0,1,0)
+        +If(Len(Trim(TextBetween(__cb,'<Sales_Person_Name>','</Sales_Person_Name>',1)))>0,1,0)) > 1, 1, 0) as __sp_multi_alias,
+     If(SubStringCount(__cb,'<SalespersonName>')=0 and SubStringCount(__cb,'<Salesperson>')=0
+        and SubStringCount(__cb,'<SalespersonFullName>')=0 and SubStringCount(__cb,'<Salesperson_Name>')=0
+        and SubStringCount(__cb,'<Sales_Person_Name>')=0
+        and Index(Upper(__cb),'SALESPERSON')>0, 1, 0) as __sp_case_risk,
+     // campos regulares do Common — ÚLTIMA ocorrência vence (mesmo vazia)
+     If(SubStringCount(__cb,'<TransactionNumber>')=0,'',Trim(TextBetween(__cb,'<TransactionNumber>','</TransactionNumber>',SubStringCount(__cb,'<TransactionNumber>')))) as TransactionNumber,
+     If(SubStringCount(__cb,'<OriginalTktId>')=0,'',Trim(TextBetween(__cb,'<OriginalTktId>','</OriginalTktId>',SubStringCount(__cb,'<OriginalTktId>')))) as OriginalTktId,
+     If(SubStringCount(__cb,'<SecurityIdentifier>')=0,'',Trim(TextBetween(__cb,'<SecurityIdentifier>','</SecurityIdentifier>',SubStringCount(__cb,'<SecurityIdentifier>')))) as SecurityIdentifier,
+     If(SubStringCount(__cb,'<SecurityCurrencyISOCode>')=0,'',Trim(TextBetween(__cb,'<SecurityCurrencyISOCode>','</SecurityCurrencyISOCode>',SubStringCount(__cb,'<SecurityCurrencyISOCode>')))) as SecurityCurrencyISOCode,
+     If(SubStringCount(__cb,'<Ticker>')=0,'',Trim(TextBetween(__cb,'<Ticker>','</Ticker>',SubStringCount(__cb,'<Ticker>')))) as Ticker,
+     If(SubStringCount(__cb,'<MaturityDateExpirationDate>')=0,'',Trim(TextBetween(__cb,'<MaturityDateExpirationDate>','</MaturityDateExpirationDate>',SubStringCount(__cb,'<MaturityDateExpirationDate>')))) as MaturityDateExpirationDate,
+     If(SubStringCount(__cb,'<BuySellCoverShortFlag>')=0,'',Trim(TextBetween(__cb,'<BuySellCoverShortFlag>','</BuySellCoverShortFlag>',SubStringCount(__cb,'<BuySellCoverShortFlag>')))) as BuySellCoverShortFlag,
+     If(SubStringCount(__cb,'<TradeDate>')=0,'',Trim(TextBetween(__cb,'<TradeDate>','</TradeDate>',SubStringCount(__cb,'<TradeDate>')))) as TradeDate,
+     If(SubStringCount(__cb,'<AsOfTradeDate>')=0,'',Trim(TextBetween(__cb,'<AsOfTradeDate>','</AsOfTradeDate>',SubStringCount(__cb,'<AsOfTradeDate>')))) as AsOfTradeDate,
+     If(SubStringCount(__cb,'<Price>')=0,'',Trim(TextBetween(__cb,'<Price>','</Price>',SubStringCount(__cb,'<Price>')))) as Price,
+     If(SubStringCount(__cb,'<TradeAmount>')=0,'',Trim(TextBetween(__cb,'<TradeAmount>','</TradeAmount>',SubStringCount(__cb,'<TradeAmount>')))) as TradeAmount,
+     If(SubStringCount(__cb,'<CustomerAccountCounterparty>')=0,'',Trim(TextBetween(__cb,'<CustomerAccountCounterparty>','</CustomerAccountCounterparty>',SubStringCount(__cb,'<CustomerAccountCounterparty>')))) as CustomerAccountCounterparty,
+     If(SubStringCount(__cb,'<AccountCounterpartyShortName>')=0,'',Trim(TextBetween(__cb,'<AccountCounterpartyShortName>','</AccountCounterpartyShortName>',SubStringCount(__cb,'<AccountCounterpartyShortName>')))) as AccountCounterpartyShortName,
+     If(SubStringCount(__cb,'<MasterAccountName>')=0,'',Trim(TextBetween(__cb,'<MasterAccountName>','</MasterAccountName>',SubStringCount(__cb,'<MasterAccountName>')))) as MasterAccountName,
+     If(SubStringCount(__cb,'<TraderAccountName>')=0,'',Trim(TextBetween(__cb,'<TraderAccountName>','</TraderAccountName>',SubStringCount(__cb,'<TraderAccountName>')))) as TraderAccountName,
+     If(SubStringCount(__cb,'<TraderAccountNumber>')=0,'',Trim(TextBetween(__cb,'<TraderAccountNumber>','</TraderAccountNumber>',SubStringCount(__cb,'<TraderAccountNumber>')))) as TraderAccountNumber,
+     If(SubStringCount(__cb,'<TransactionType>')=0,'',Trim(TextBetween(__cb,'<TransactionType>','</TransactionType>',SubStringCount(__cb,'<TransactionType>')))) as TransactionType,
+     If(SubStringCount(__cb,'<OMReasonCode>')=0,'',Trim(TextBetween(__cb,'<OMReasonCode>','</OMReasonCode>',SubStringCount(__cb,'<OMReasonCode>')))) as OMReasonCode;
+LOAD source_file, file_date_token, feed_no, feed_blob,
+     TextBetween(feed_blob, '<Common>', '</Common>', 1) & '' as __cb,
+     TextBetween(feed_blob, '<ExtendedFields>', '</ExtendedFields>', 1) & '' as __eb,
+     If(Index(feed_blob,'<TransactionCosts>')>0 and Index(feed_blob,'</TransactionCosts>')>0,
+        Left(feed_blob, Index(feed_blob,'<TransactionCosts>')-1) & Mid(feed_blob, Index(feed_blob,'</TransactionCosts>') + 19),
+        If(Index(feed_blob,'<TransactionCosts>')>0,
+           Left(feed_blob, Index(feed_blob,'<TransactionCosts>')-1),
+           feed_blob)) as __wo
+RESIDENT _FEEDS;
+
+// junta agregados de TransactionCost e contagem de blocos
+Left Join(_PARSED) LOAD source_file, feed_no, addon_sum_text, fallback_cost_text RESIDENT _TXC_ADDON;
+Left Join(_PARSED) LOAD source_file, feed_no, _n_txcs_blocks RESIDENT _TXCCOUNT;
+DROP TABLES _TXC_ADDON, _TXCCOUNT, _FEEDS;
+
+// auditoria das premissas do parser textual
+AUDIT_XML_SCAN:
+LOAD Sum(If(_n_txcs_blocks>1,1,0))   as audit_feeds_multi_txcs_blocks,
+     Sum(__sp_multi_alias)           as audit_feeds_multi_salesperson_alias,
+     Sum(__sp_case_risk)             as audit_feeds_salesperson_case_risk,
+     Sum(__ext_mixed_attr)           as audit_feeds_ext_mixed_attr
+RESIDENT _PARSED;
+LET vAuditTxcBlocks = Alt(Peek('audit_feeds_multi_txcs_blocks',0,'AUDIT_XML_SCAN'),0);
+IF $(vAuditTxcBlocks) > 0 THEN
+  TRACE [CASTINE][WARN] $(vAuditTxcBlocks) feed(s) com >1 bloco TransactionCosts — premissa do parser violada, revisar paridade.;
+END IF
+DROP FIELDS __sp_case_risk, __sp_multi_alias, __ext_mixed_attr FROM _PARSED;
+
+// ordem determinística de leitura (arquivo asc, feed asc) = desempate documentado
+// (Python usa ordem de conclusão do pool — não-determinística entre execuções).
+// Consolidação do custo primário (find_primary_cost_tradefeed L1010-1034) e AddOn.
+_RAW:
+NoConcatenate
+LOAD *,
+     $(fXmlVal(__cost_pick)) as Cost_original,
+     If(Len(addon_sum_text)>0, addon_sum_text, '') as AddOn_original,
+     RowNo() as __raw_row_id;
+LOAD *,
+     If('$(vPreferCostOutsideTxc)'='1',
+        If(Len(__cost_out)>0, __cost_out,
+           If('$(vAllowTxcFallback)'='1' and Len(fallback_cost_text)>0, fallback_cost_text, '')),
+        If(Len(fallback_cost_text)>0, fallback_cost_text, '')) as __cost_pick
+RESIDENT _PARSED ORDER BY source_file ASC, feed_no ASC;
+DROP TABLE _PARSED;
+DROP FIELDS __cost_out, __cost_pick, fallback_cost_text, addon_sum_text, _n_txcs_blocks FROM _RAW;
+
+// parse numérico dos custos (strings idênticas às do Python -> valores idênticos)
+CALL ParseCostColumn('_RAW', 'Cost_original', 'Cost_original_numeric');
+CALL ParseCostColumn('_RAW', 'AddOn_original', 'AddOn_numeric');
+
+///$tab 04 — Versionamento & Cancels
+// ============================================================================
+// 04 — keep_last_version (L1199-1271) + remove_cancels (L1274-1283)
+// Chave de grupo: TransactionNumber -> OriginalTktId -> SecId||TradeDate||Amount.
+// Ordena por (chave, token_int, asof_dt) estável; fica a ÚLTIMA; carrega
+// OriginalVersionTradeDate (1º TradeDate não-vazio da cadeia) e VersionCount.
+// ============================================================================
+_V0:
+LOAD *,
+     // prefixo: sem ele o Qlik compara '007' = '7' como número
+     'K|' & If(Len(Trim(TransactionNumber))>0, Trim(TransactionNumber),
+        If(Len(Trim(OriginalTktId))>0, Trim(OriginalTktId),
+           Trim(SecurityIdentifier) & '||' & Trim(TradeDate) & '||' & Trim(TradeAmount))) as __group_key,
+     Alt(Num#(file_date_token), 0) as __token_int
+RESIDENT _RAW;
+DROP TABLE _RAW;
+
+// _asof_dt p/ ordenação: pd.to_datetime(errors='coerce') -> NaT = Timestamp.min (L1225)
+// (usa fPdDate — espelho do pd.to_datetime; NÃO o parser custom, que tem o quirk
+//  do serial Excel. Distinção deliberada, ver 02_BUSINESS_RULES_MAPPING R-S07.)
+_V1:
+NoConcatenate
+LOAD *, Alt($(fPdDate(AsOfTradeDate)), $(vTsFloorMin)) as __asof_ord
+RESIDENT _V0;
+DROP TABLE _V0;
+
+_V2:
+NoConcatenate
+LOAD *,
+     RowNo() as __ord,
+     // carrega 1º TradeDate não-vazio da cadeia (ordem ASC) — L1250-1261
+     If(__group_key <> Previous(__group_key),
+        If(Len(Trim(TradeDate))>0 and Match(Lower(Trim(TradeDate)),'nan','nat','none','null')=0, Trim(TradeDate), ''),
+        If(Len(Peek('__orig_td'))>0, Peek('__orig_td'),
+           If(Len(Trim(TradeDate))>0 and Match(Lower(Trim(TradeDate)),'nan','nat','none','null')=0, Trim(TradeDate), ''))) as __orig_td
+RESIDENT _V1
+ORDER BY __group_key ASC, __token_int ASC, __asof_ord ASC, __raw_row_id ASC;
+DROP TABLE _V1;
+
+_VLAST:
+LOAD __group_key,
+     Max(__ord) as __ord,
+     Count(__ord) as VersionCount
+RESIDENT _V2 GROUP BY __group_key;
+
+Inner Join(_V2) LOAD __group_key, __ord, VersionCount RESIDENT _VLAST;
+DROP TABLE _VLAST;
+
+XML_V:
+NoConcatenate
+LOAD *,
+     __orig_td as OriginalVersionTradeDate,
+     If(VersionCount > 1, 1, 0) as IsModifiedVersionChain
+RESIDENT _V2;
+DROP TABLE _V2;
+DROP FIELDS __orig_td, __ord, __asof_ord, __token_int FROM XML_V;
+
+LET vRowsAfterVersioning = NoOfRows('XML_V');
+TRACE [CASTINE] rows_after_versioning: $(vRowsAfterVersioning);
+
+// remove_cancels (L1274-1283): TransactionType contém 'x' (case-insensitive) -> fora
+XML_NC:
+NoConcatenate LOAD * RESIDENT XML_V
+WHERE Index(Upper(TransactionType & ''), 'X') = 0;
+DROP TABLE XML_V;
+
+LET vRowsAfterCancels = Alt(NoOfRows('XML_NC'), 0);
+IF $(vRowsAfterCancels) = 0 THEN
+  TRACE [CASTINE][EXIT] Cancels removal produced 0 rows. (main L3479-3481);
+  CALL AbortNoRowsAfterCancels_UndefinedSub_ForcesScriptError;
+END IF
+LET vCancelsRemoved = $(vRowsAfterVersioning) - $(vRowsAfterCancels);
+TRACE [CASTINE] rows_after_remove_cancels: $(vRowsAfterCancels) (removed=$(vCancelsRemoved));
+
+///$tab 05 — Split Matrix
+// ============================================================================
+// 05 — SPLIT MATRIX (load_split_matrix_castine L1290-1536)
+// Varre candidatos de aba × header 0..4 (Python varre TODAS as abas; o Qlik não
+// enumera abas de xlsx em script — limitação documentada; configure
+// vSplitSheetCandidates). Detecção de colunas espelha detect_split_columns
+// (L720-775): match EXATO (o ÚLTIMO exato vence) senão CONTÉM (o 1º vence).
+// Validações: linhas inválidas -> SPLIT_CONFIG_ALERTS; soma por versão fora de
+// 1±tolerância e janelas sobrepostas -> versões inteiras invalidadas.
+// ============================================================================
+SET vSplitOK = 0;
+SET vSplitRowsRead = 0;
+SET vSplitUsableRows = 0;
+LET vSplitSheet = '';
+LET vSplitHeader = -1;
+SET vColRR = ''; SET vColSplit = ''; SET vColSales = ''; SET vColEff = ''; SET vColExp = '';
+
+IF '$(vApplySplit)' = '1' THEN
+  LET _nSplitFile = 0;
+  FOR Each _f in FileList('$(vLibSplit)$(vSplitMatrixFile)')
+    LET _nSplitFile = $(_nSplitFile) + 1;
+  NEXT _f
+  IF $(_nSplitFile) = 0 THEN
+    TRACE [CASTINE][ERROR] Split Matrix NOT FOUND (L1338-1340). Payout XML/Repo ficará vazio após drop-unmapped.;
+  ELSE
+    FOR Each _vSheet in $(vSplitSheetList)
+      FOR _vH = 0 to 4
+        IF $(vSplitHeader) = -1 THEN
+          SET ErrorMode = 0;
+          IF $(_vH) = 0 THEN
+            _TRY_SPLIT:
+            First 1 LOAD * FROM [$(vLibSplit)$(vSplitMatrixFile)]
+            (ooxml, embedded labels, table is [$(_vSheet)]);
+          ELSE
+            _TRY_SPLIT:
+            First 1 LOAD * FROM [$(vLibSplit)$(vSplitMatrixFile)]
+            (ooxml, embedded labels, header is $(_vH) lines, table is [$(_vSheet)]);
+          END IF
+          SET ErrorMode = 1;
+          IF Alt(NoOfFields('_TRY_SPLIT'),0) > 0 THEN
+            // detect_split_columns na ordem das colunas
+            SET _rrX=''; SET _rrC=''; SET _spX=''; SET _spC=''; SET _saX=''; SET _saC='';
+            SET _efX=''; SET _efC=''; SET _exX=''; SET _exC='';
+            FOR _ci = 1 to NoOfFields('_TRY_SPLIT')
+              LET _cn = FieldName($(_ci), '_TRY_SPLIT');
+              LET _nn = KeepChar(Lower('$(_cn)'), 'abcdefghijklmnopqrstuvwxyz0123456789');
+              IF '$(_nn)' = 'rrteam' THEN
+                LET _rrX = '$(_cn)';            // exato: último vence (insert(0))
+              ELSEIF Index('$(_nn)','rr')>0 and Index('$(_nn)','team')>0 and Len('$(_rrC)')=0 THEN
+                LET _rrC = '$(_cn)';            // contém: primeiro vence
+              END IF
+              IF '$(_nn)' = 'split' THEN
+                LET _spX = '$(_cn)';
+              ELSEIF Index('$(_nn)','split')>0 and Index('$(_nn)','sum')=0 and Index('$(_nn)','status')=0 and Index('$(_nn)','check')=0 and Len('$(_spC)')=0 THEN
+                LET _spC = '$(_cn)';
+              END IF
+              IF '$(_nn)' = 'salesperson' THEN
+                LET _saX = '$(_cn)';
+              ELSEIF Index('$(_nn)','salesperson')>0 and Len('$(_saC)')=0 THEN
+                LET _saC = '$(_cn)';
+              END IF
+              IF Match('$(_nn)','effectivedate','effectivefrom','startdate','validfrom','fromdate')>0 THEN
+                LET _efX = '$(_cn)';
+              ELSEIF ((Index('$(_nn)','effective')>0 and Index('$(_nn)','date')>0) or (Index('$(_nn)','valid')>0 and Index('$(_nn)','from')>0)) and Len('$(_efC)')=0 THEN
+                LET _efC = '$(_cn)';
+              END IF
+              IF Match('$(_nn)','expirationdate','expirydate','effectiveto','enddate','validto','todate','expiration')>0 THEN
+                LET _exX = '$(_cn)';
+              ELSEIF ((Index('$(_nn)','expir')>0 and Index('$(_nn)','date')>0) or Index('$(_nn)','expiry')>0 or (Index('$(_nn)','valid')>0 and Index('$(_nn)','to')>0)) and Len('$(_exC)')=0 THEN
+                LET _exC = '$(_cn)';
+              END IF
+            NEXT _ci
+            LET _rr = If(Len('$(_rrX)')>0, '$(_rrX)', '$(_rrC)');
+            LET _sp = If(Len('$(_spX)')>0, '$(_spX)', '$(_spC)');
+            LET _sa = If(Len('$(_saX)')>0, '$(_saX)', '$(_saC)');
+            LET _ef = If(Len('$(_efX)')>0, '$(_efX)', '$(_efC)');
+            LET _ex = If(Len('$(_exX)')>0, '$(_exX)', '$(_exC)');
+            IF Len('$(_rr)')>0 and Len('$(_sp)')>0 and Len('$(_sa)')>0 and '$(_rr)' <> '$(_sp)' and '$(_rr)' <> '$(_sa)' and '$(_sp)' <> '$(_sa)' THEN
+              LET vSplitSheet = '$(_vSheet)';
+              LET vSplitHeader = $(_vH);
+              LET vColRR = '$(_rr)'; LET vColSplit = '$(_sp)'; LET vColSales = '$(_sa)';
+              LET vColEff = '$(_ef)'; LET vColExp = '$(_ex)';
+            END IF
+          END IF
+          IF Alt(TableNumber('_TRY_SPLIT'), -1) >= 0 THEN
+            DROP TABLE _TRY_SPLIT;
+          END IF
+        END IF
+      NEXT _vH
+    NEXT _vSheet
+  END IF
+END IF
+
+// seed '__SEED__' impede o descarte de tabela vazia; filtrado na exportação
+SPLIT_CONFIG_ALERTS:
+LOAD '__SEED__' as alert_type, '' as [RR Team], '' as Salesperson, '' as Split_raw,
+     Null() as Split_num, '' as [Effective Date], '' as [Expiration Date],
+     '' as VersionKey, '' as details
+AUTOGENERATE 1;
+
+IF $(vSplitHeader) >= 0 THEN
+  TRACE [CASTINE] Split: sheet='$(vSplitSheet)' header_row=$(vSplitHeader) RR='$(vColRR)' Split='$(vColSplit)' Sales='$(vColSales)' Eff='$(vColEff)' Exp='$(vColExp)';
+
+  _SPLIT0:
+  LOAD
+    If(Len(Text([$(vColRR)]))=0, '', Text([$(vColRR)])) as RRTeam_raw,
+    Trim(If(Len(Text([$(vColSales)]))=0, '', Text([$(vColSales)]))) as Salesperson_split_raw,
+    If(Len(Text([$(vColSplit)]))=0, '', If(IsNum([$(vColSplit)]), Text(Num([$(vColSplit)], '0.##############', '.', '')), Text([$(vColSplit)]))) as Split_raw
+    $(=If(Len('$(vColEff)')>0, ', [' & '$(vColEff)' & '] as __eff_raw0', ''))
+    $(=If(Len('$(vColExp)')>0, ', [' & '$(vColExp)' & '] as __exp_raw0', ''))
+  FROM [$(vLibSplit)$(vSplitMatrixFile)]
+  (ooxml, embedded labels, $(=If($(vSplitHeader)>0, 'header is $(vSplitHeader) lines,', '')) table is [$(vSplitSheet)]);
+
+  // garante colunas de data mesmo ausentes na planilha (rebuild resident)
+  IF Alt(FieldNumber('__eff_raw0', '_SPLIT0'), 0) = 0 THEN
+    _SPLIT0E: NoConcatenate LOAD *, '' as __eff_raw0 RESIDENT _SPLIT0;
+    DROP TABLE _SPLIT0; RENAME TABLE _SPLIT0E TO _SPLIT0;
+  END IF
+  IF Alt(FieldNumber('__exp_raw0', '_SPLIT0'), 0) = 0 THEN
+    _SPLIT0X: NoConcatenate LOAD *, '' as __exp_raw0 RESIDENT _SPLIT0;
+    DROP TABLE _SPLIT0; RENAME TABLE _SPLIT0X TO _SPLIT0;
+  END IF
+
+  _SPLIT1:
+  NoConcatenate
+  LOAD RRTeam_raw,
+       Salesperson_split_raw,
+       Split_raw,
+       If(Len(__eff_raw0)>0, Text(__eff_raw0), '') as EffectiveDate_raw,
+       If(Len(__exp_raw0)>0, Text(__exp_raw0), '') as ExpirationDate_raw,
+       __eff_raw0, __exp_raw0,
+       $(fNormTeam(RRTeam_raw)) as RRTeam_norm,
+       $(fParseSplit(Split_raw)) as Split_num
+  RESIDENT _SPLIT0;
+  DROP TABLE _SPLIT0;
+
+  // parse_date_to_date (L715-717) nas janelas — parser CUSTOM + Floor (.date())
+  CALL ParseDateColumn('_SPLIT1', '__eff_raw0', '__eff_dt0');
+  CALL ParseDateColumn('_SPLIT1', '__exp_raw0', '__exp_dt0');
+
+  SPLIT_ALL:
+  NoConcatenate
+  LOAD *,
+       Alt(EffectiveDate_dt, $(vTsMin)) as EffectiveDate_cmp,
+       Alt(ExpirationDate_dt, $(vTsMax)) as ExpirationDate_cmp,
+       RRTeam_norm & '||' & Date(Alt(EffectiveDate_dt, $(vTsMin)),'YYYYMMDD') & '||' & Date(Alt(ExpirationDate_dt, $(vTsMax)),'YYYYMMDD') as VersionKey;
+  LOAD RRTeam_raw, Salesperson_split_raw, Split_raw, EffectiveDate_raw, ExpirationDate_raw,
+       RRTeam_norm, Split_num,
+       If(Len(__eff_dt0)>0, Floor(__eff_dt0)) as EffectiveDate_dt,
+       If(Len(__exp_dt0)>0, Floor(__exp_dt0)) as ExpirationDate_dt
+  RESIDENT _SPLIT1;
+  DROP TABLE _SPLIT1;
+
+  LET vSplitRowsRead = NoOfRows('SPLIT_ALL');
+
+  // flags de validação por linha (L1450-1468)
+  _SPLITF:
+  NoConcatenate
+  LOAD *,
+       If(RRTeam_norm='',1,0) as __f_blank_rr,
+       If(Salesperson_split_raw='',1,0) as __f_blank_sales,
+       If(Len(Split_num & '')=0,1,0) as __f_invalid_split,
+       If(Len(Trim(EffectiveDate_raw))>0 and Len(EffectiveDate_dt & '')=0,1,0) as __f_invalid_eff,
+       If(Len(Trim(ExpirationDate_raw))>0 and Len(ExpirationDate_dt & '')=0,1,0) as __f_invalid_exp,
+       If(Len(EffectiveDate_dt)>0 and Len(ExpirationDate_dt)>0 and EffectiveDate_dt > ExpirationDate_dt,1,0) as __f_invalid_order
+  RESIDENT SPLIT_ALL;
+  DROP TABLE SPLIT_ALL;
+
+  // alertas por tipo (ordem de tipos igual ao Python)
+  FOR Each _at in 'MISSING_RR_TEAM','MISSING_SALESPERSON','INVALID_SPLIT','INVALID_EFFECTIVE_DATE','INVALID_EXPIRATION_DATE','INVALID_DATE_RANGE'
+    LET _fld = Pick(Match('$(_at)','MISSING_RR_TEAM','MISSING_SALESPERSON','INVALID_SPLIT','INVALID_EFFECTIVE_DATE','INVALID_EXPIRATION_DATE','INVALID_DATE_RANGE'),
+                    '__f_blank_rr','__f_blank_sales','__f_invalid_split','__f_invalid_eff','__f_invalid_exp','__f_invalid_order');
+    LET _dt = Pick(Match('$(_at)','MISSING_RR_TEAM','MISSING_SALESPERSON','INVALID_SPLIT','INVALID_EFFECTIVE_DATE','INVALID_EXPIRATION_DATE','INVALID_DATE_RANGE'),
+                   'RR Team is blank.','Salesperson is blank.','Split could not be parsed to a decimal between 0 and 1.','Effective Date could not be parsed.','Expiration Date could not be parsed.','Effective Date is later than Expiration Date.');
+    Concatenate(SPLIT_CONFIG_ALERTS)
+    LOAD '$(_at)' as alert_type,
+         RRTeam_raw as [RR Team],
+         Salesperson_split_raw as Salesperson,
+         Split_raw,
+         Split_num,
+         EffectiveDate_raw as [Effective Date],
+         ExpirationDate_raw as [Expiration Date],
+         VersionKey,
+         '$(_dt)' as details
+    RESIDENT _SPLITF WHERE [$(_fld)] = 1;
+  NEXT _at
+
+  // usable = sem nenhum flag (L1468-1469)
+  SPLIT_USABLE:
+  NoConcatenate LOAD RowNo() as __split_row_id, RRTeam_raw, Salesperson_split_raw, Split_raw, Split_num,
+       EffectiveDate_raw, ExpirationDate_raw, EffectiveDate_dt, ExpirationDate_dt,
+       EffectiveDate_cmp, ExpirationDate_cmp, RRTeam_norm, VersionKey
+  RESIDENT _SPLITF
+  WHERE __f_blank_rr=0 and __f_blank_sales=0 and __f_invalid_split=0
+    and __f_invalid_eff=0 and __f_invalid_exp=0 and __f_invalid_order=0;
+  DROP TABLE _SPLITF;
+
+  LET vSplitUsableRows = NoOfRows('SPLIT_USABLE');
+
+  IF $(vSplitUsableRows) > 0 THEN
+    // soma de split por versão (L1476-1483)
+    _VSUM: LOAD VersionKey, Sum(Split_num) as VersionSplitSum RESIDENT SPLIT_USABLE GROUP BY VersionKey;
+    Left Join(SPLIT_USABLE) LOAD VersionKey, VersionSplitSum RESIDENT _VSUM;
+    DROP TABLE _VSUM;
+
+    _BADSUM: LOAD '§none§' as __bad_vk AUTOGENERATE 1;
+    Concatenate(_BADSUM)
+    LOAD Distinct VersionKey as __bad_vk RESIDENT SPLIT_USABLE
+    WHERE Fabs(VersionSplitSum - 1.0) > $(vSplitSumTolerance);
+    Concatenate(SPLIT_CONFIG_ALERTS)
+    LOAD 'CHECK_SPLIT_SUM' as alert_type, RRTeam_raw as [RR Team], Salesperson_split_raw as Salesperson,
+         Split_raw, Split_num, EffectiveDate_raw as [Effective Date], ExpirationDate_raw as [Expiration Date],
+         VersionKey,
+         'For a given RR Team and the same Effective Date + Expiration Date window, split must sum to 1.00 (100%) within tolerance.' as details
+    RESIDENT SPLIT_USABLE WHERE Exists(__bad_vk, VersionKey);
+
+    // janelas sobrepostas por time (L1485-1515): pares com interseção inclusiva
+    _WIN: LOAD Distinct RRTeam_norm as __w_team, VersionKey as __w_vk,
+               EffectiveDate_cmp as __w_eff, ExpirationDate_cmp as __w_exp
+          RESIDENT SPLIT_USABLE;
+    _PAIR: LOAD __w_team as __p_team, __w_vk as __p_vkA, __w_eff as __p_effA, __w_exp as __p_expA RESIDENT _WIN;
+    Left Join(_PAIR) LOAD __w_team as __p_team, __w_vk as __p_vkB, __w_eff as __p_effB, __w_exp as __p_expB RESIDENT _WIN;
+    _OVK: LOAD '§none§' as __ovl_vk AUTOGENERATE 1;
+    Concatenate(_OVK)
+    LOAD Distinct __p_vkA as __ovl_vk RESIDENT _PAIR
+    WHERE __p_vkA <> __p_vkB and __p_effB <= __p_expA and __p_effA <= __p_expB;
+    DROP TABLES _WIN, _PAIR;
+
+    Concatenate(SPLIT_CONFIG_ALERTS)
+    LOAD 'OVERLAPPING_DATE_WINDOWS' as alert_type, RRTeam_raw as [RR Team], Salesperson_split_raw as Salesperson,
+         Split_raw, Split_num, EffectiveDate_raw as [Effective Date], ExpirationDate_raw as [Expiration Date],
+         VersionKey,
+         'More than one split version is active for the same RR Team/date range.' as details
+    RESIDENT SPLIT_USABLE WHERE Exists(__ovl_vk, VersionKey);
+
+    // valid = usable sem versões inválidas (L1517-1518)
+    SPLIT_VALID:
+    NoConcatenate LOAD * RESIDENT SPLIT_USABLE
+    WHERE not Exists(__bad_vk, VersionKey) and not Exists(__ovl_vk, VersionKey);
+    DROP TABLES _BADSUM, _OVK;
+
+    LET vSplitValidRows = Alt(NoOfRows('SPLIT_VALID'), 0);
+    IF $(vSplitValidRows) > 0 THEN
+      SET vSplitOK = 1;
+    ELSE
+      TRACE [CASTINE][ERROR] Split Matrix: 0 linhas válidas após checks de soma/overlap (L1532-1534).;
+      IF Alt(TableNumber('SPLIT_VALID'), -1) >= 0 THEN
+        DROP TABLE SPLIT_VALID;
+      END IF
+    END IF
+  ELSE
+    TRACE [CASTINE][ERROR] Split Matrix: 0 linhas utilizáveis após validação (L1471-1474).;
+  END IF
+  IF Alt(TableNumber('SPLIT_USABLE'), -1) >= 0 THEN
+    DROP TABLE SPLIT_USABLE;
+  END IF
+ELSE
+  IF '$(vApplySplit)' = '1' THEN
+    TRACE [CASTINE][ERROR] Não foi possível detectar colunas RR Team/Salesperson/Split na Split Matrix (L1380-1387). Configure vSplitSheetCandidates.;
+  END IF
+END IF
+
+LET vSplitValidRows = If('$(vSplitOK)'='1', Alt(NoOfRows('SPLIT_VALID'),0), 0);
+LET vSplitConfigAlerts = NoOfRows('SPLIT_CONFIG_ALERTS');
+TRACE [CASTINE] Split valid rows: $(vSplitValidRows) | config alerts: $(vSplitConfigAlerts) | split_ok=$(vSplitOK);
+
+///$tab 06 — Merge Split XML
+// ============================================================================
+// 06 — MERGE XML × SPLIT (merge_split_and_compute L1599-1694)
+//      + team mismatch (build_team_mismatch_alerts L1543-1592, chamada L3493-3496)
+// RR Team = SalespersonName.strip(); SplitApplyDate = AsOf -> Trade -> data do
+// processo (pd.to_datetime + normalize = Floor); LEFT JOIN em RRTeam_norm
+// preservando 1-para-N; filtro de janela INCLUSIVO; drops com motivo.
+// ============================================================================
+
+XML_BASE:
+NoConcatenate
+LOAD *,
+     Trim(SalespersonName) as [RR Team],
+     Alt(Floor($(fPdDate(AsOfTradeDate))), Floor($(fPdDate(TradeDate))), $(vPayoutDateNum)) as SplitApplyDateNum
+RESIDENT XML_NC;
+DROP TABLE XML_NC;
+
+// --- team mismatch: XML (RR Team <> '') vs SPLIT_VALID — chaves únicas -------
+_MM_XML:
+LOAD __mm_key,
+     FirstValue(__mm_rr) as __mm_example,
+     Count(__mm_rr) as __mm_count
+GROUP BY __mm_key;
+LOAD $(fNormTeam([RR Team])) as __mm_key,
+     [RR Team] as __mm_rr
+RESIDENT XML_BASE
+WHERE Len(Trim([RR Team])) > 0;
+
+// times válidos p/ motivo de drop (seed '§none§' garante o campo)
+_VTEAMS: LOAD '§none§' as __valid_team AUTOGENERATE 1;
+IF '$(vSplitOK)' = '1' THEN
+  Concatenate(_VTEAMS) LOAD Distinct RRTeam_norm as __valid_team RESIDENT SPLIT_VALID;
+END IF
+
+IF Alt(TableNumber('_MM_XML'), -1) < 0 THEN
+  _MM_XML: LOAD '§none§' as __mm_key, '' as __mm_example, 0 as __mm_count AUTOGENERATE 1;
+END IF
+TEAM_MISMATCH:
+LOAD '__SEED__' as side, '' as key, '' as example_original, 0 as count_rows AUTOGENERATE 1;
+Concatenate(TEAM_MISMATCH)
+LOAD 'XML_ONLY' as side, __mm_key as key, __mm_example as example_original, __mm_count as count_rows
+RESIDENT _MM_XML
+WHERE __mm_key <> '§none§' and not Exists(__valid_team, __mm_key);
+
+IF '$(vSplitOK)' = '1' THEN
+  _MM_SPLIT:
+  LOAD RRTeam_norm as __ms_key,
+       FirstValue(RRTeam_raw) as __ms_example,
+       Count(RRTeam_raw) as __ms_count
+  RESIDENT SPLIT_VALID
+  GROUP BY RRTeam_norm;
+
+  Concatenate(TEAM_MISMATCH)
+  LOAD 'SPLIT_ONLY' as side, __ms_key as key, __ms_example as example_original, __ms_count as count_rows
+  RESIDENT _MM_SPLIT
+  WHERE not Exists(__mm_key, __ms_key);
+  DROP TABLE _MM_SPLIT;
+END IF
+DROP TABLE _MM_XML;
+
+_TM2: NoConcatenate LOAD * RESIDENT TEAM_MISMATCH ORDER BY side, key;
+DROP TABLE TEAM_MISMATCH; RENAME TABLE _TM2 TO TEAM_MISMATCH;
+
+// ---------------------------------------------------------------------------
+// SUB ApplySplitDateAware: núcleo do merge usado por XML (L1599-1694) e REPO
+// (L2137-2268) — semântica IDÊNTICA nos dois no Python (duas cópias quase
+// iguais; centralizado aqui para impedir deriva).
+// Requer em pIn: [RR Team], RRTeam_norm, SplitApplyDateNum, __src_id.
+// Produz: <pIn>_MATCHED (com Split_num, Split_raw, Salesperson_split_raw,
+//         EffectiveDate_*/ExpirationDate_*, VersionKey) e
+//         <pIn>_DROPPED (com drop_reason RRTEAM_EMPTY / SPLIT_MATRIX_NOT_USABLE /
+//         RRTEAM_NOT_MAPPED_IN_SPLIT_MATRIX / NO_ACTIVE_SPLIT_FOR_DATE).
+// ---------------------------------------------------------------------------
+SUB ApplySplitDateAware(pIn)
+  // semente copia a estrutura de pIn: os alertas leem campos mesmo sem nenhum drop
+  [$(pIn)_DROPPED]:
+  NoConcatenate First 1 LOAD *, '__SEED__' as drop_reason RESIDENT [$(pIn)];
+
+  Concatenate([$(pIn)_DROPPED])
+  LOAD *, 'RRTEAM_EMPTY' as drop_reason
+  RESIDENT [$(pIn)] WHERE Len(Trim([RR Team] & '')) = 0;
+
+  [$(pIn)_REST]:
+  NoConcatenate LOAD * RESIDENT [$(pIn)] WHERE Len(Trim([RR Team] & '')) > 0;
+  DROP TABLE [$(pIn)];
+
+  IF Alt(NoOfRows('$(pIn)_REST'), 0) > 0 THEN
+    IF '$(vSplitOK)' = '0' THEN
+      Concatenate([$(pIn)_DROPPED])
+      LOAD *, 'SPLIT_MATRIX_NOT_USABLE' as drop_reason RESIDENT [$(pIn)_REST];
+    ELSE
+      // LEFT JOIN 1-para-N em RRTeam_norm (L1639-1655) e filtro de janela (L1657-1662)
+      [$(pIn)_MRG]:
+      NoConcatenate LOAD * RESIDENT [$(pIn)_REST];
+      Left Join([$(pIn)_MRG])
+      LOAD __split_row_id, RRTeam_norm, Split_num, Split_raw, Salesperson_split_raw,
+           EffectiveDate_cmp, ExpirationDate_cmp, EffectiveDate_raw, ExpirationDate_raw, VersionKey
+      RESIDENT SPLIT_VALID;
+
+      [$(pIn)_MATCHED]:
+      NoConcatenate LOAD * RESIDENT [$(pIn)_MRG]
+      WHERE Len(EffectiveDate_cmp & '') > 0
+        and SplitApplyDateNum >= EffectiveDate_cmp
+        and SplitApplyDateNum <= ExpirationDate_cmp;
+
+      // Exists enxerga valores de chamadas anteriores: o campo é exclusivo de pIn
+      _MIDS: LOAD -1 as [__matched$(pIn)] AutoGenerate 1;
+      IF Alt(NoOfRows('$(pIn)_MATCHED'), 0) > 0 THEN
+        Concatenate(_MIDS) LOAD Distinct __src_id as [__matched$(pIn)] RESIDENT [$(pIn)_MATCHED];
+      END IF
+
+      Concatenate([$(pIn)_DROPPED])
+      LOAD *,
+           If(Exists(__valid_team, RRTeam_norm), 'NO_ACTIVE_SPLIT_FOR_DATE', 'RRTEAM_NOT_MAPPED_IN_SPLIT_MATRIX') as drop_reason
+      RESIDENT [$(pIn)_REST]
+      WHERE not Exists([__matched$(pIn)], __src_id);
+
+      DROP TABLES _MIDS, [$(pIn)_MRG];
+    END IF
+  END IF
+  IF Alt(TableNumber('$(pIn)_REST'), -1) >= 0 THEN
+    DROP TABLE [$(pIn)_REST];
+  END IF
+END SUB
+
+
+// aplica no XML
+_XMLM:
+NoConcatenate
+LOAD *, $(fNormTeam([RR Team])) as RRTeam_norm, RowNo() as __src_id
+RESIDENT XML_BASE;
+DROP TABLE XML_BASE;
+
+CALL ApplySplitDateAware('_XMLM');
+
+// cálculos (L1674-1691): Commission = round10(cost0 + addon0);
+// Production = round2(Commission * split) — HALF-TO-EVEN (numpy)
+IF Alt(NoOfRows('_XMLM_MATCHED'), 0) > 0 THEN
+  XML_MAPPED:
+  NoConcatenate
+  LOAD *,
+       $(fRound2(Commission_total_numeric * Split_num)) as ProductionEarned
+  ;
+  LOAD *,
+       Trim(Salesperson_split_raw) & '' as Salesperson,
+       $(fRound10(__comm_raw)) as Commission_total_numeric;
+  LOAD *,
+       Alt(Cost_original_numeric,0) + Alt(AddOn_numeric,0) as __comm_raw
+  RESIDENT _XMLM_MATCHED;
+  DROP TABLE _XMLM_MATCHED;
+ELSEIF Alt(TableNumber('_XMLM_MATCHED'), -1) >= 0 THEN
+  DROP TABLE _XMLM_MATCHED;
+END IF
+
+LET vXmlRowsMapped = Alt(NoOfRows('XML_MAPPED'), 0);
+LET vXmlRowsDropped = Alt(NoOfRows('_XMLM_DROPPED'), 1) - 1;   // -1 do seed
+TRACE [CASTINE] rows_before_split_merge: $(vRowsAfterCancels);
+TRACE [CASTINE] rows_mapped: $(vXmlRowsMapped) | rows_dropped_unmapped: $(vXmlRowsDropped);
+
+// arquivo de alerta split_unmapped (colunas main L3521-3546)
+ALERT_SPLIT_UNMAPPED:
+NoConcatenate
+LOAD If(drop_reason='__SEED__', '__SEED__', TransactionNumber) as TransactionNumber,
+     [RR Team],
+     '' as Salesperson,
+     '' as Split_raw,
+     Null() as Split_num,
+     Cost_original,
+     AddOn_original,
+     Cost_original_numeric,
+     AddOn_numeric,
+     Null() as Commission_total_numeric,
+     $(fPrefixApos(CustomerAccountCounterparty)) as CustomerAccountCounterparty,
+     MasterAccountName,
+     Ticker,
+     MaturityDateExpirationDate,
+     source_file,
+     file_date_token,
+     drop_reason
+RESIDENT _XMLM_DROPPED;
+DROP TABLE _XMLM_DROPPED;
+// (linha __SEED__ permanece até a exportação, onde é filtrada)
+
+///$tab 07 — Saída Oficial XML & Non-USD
+// ============================================================================
+// 07 — build_official_output (L1701-1778) + exclude_xml_nonusd (L1781-1808)
+// ============================================================================
+IF $(vXmlRowsMapped) > 0 and Alt(TableNumber('XML_MAPPED'),-1) >= 0 THEN
+  // datas de saída usam o parser CUSTOM (fmt_mdy_no_zeros -> parse_date_to_datetime)
+  CALL ParseDateColumn('XML_MAPPED', 'AsOfTradeDate', '__asof_out_dt');
+
+  _OFF0:
+  NoConcatenate
+  LOAD *,
+       // Trade Date: OriginalVersionTradeDate não-vazio senão TradeDate (L1714-1717)
+       If(Len(Trim(OriginalVersionTradeDate))>0, Trim(OriginalVersionTradeDate), Trim(TradeDate)) as __td_src
+  RESIDENT XML_MAPPED;
+  DROP TABLE XML_MAPPED;
+  CALL ParseDateColumn('_OFF0', '__td_src', '__td_out_dt');
+
+  XML_PAYOUT:
+  NoConcatenate
+  LOAD
+     $(fFmtMDY(__asof_out_dt)) as [As of trade date],
+     If(Len(Trim(MasterAccountName))>0, Trim(MasterAccountName), Trim(AccountCounterpartyShortName)) as [Client],
+     Trim(SecurityIdentifier) as [Security],
+     Trim(TransactionNumber) as [Trade Id],
+     Salesperson as [Salesperson],
+     ProductionEarned as [Production Earned],
+     ProductionEarned as [Payout Earned],
+     Trim(TraderAccountNumber) as [Trader Team Name],
+     '' as [Fidelity #],
+     Trim(TraderAccountName) as [ShortDesc],
+     Trim(OMReasonCode) as [TradeType],
+     $(fFmtMDY(__td_out_dt)) as [Trade Date],
+     Trim([RR Team]) as [RR Team],
+     'Bloomberg XML' as [Source],
+     Trim(SECURITY_TYP) as [Sec Type],
+     Trim(MARKET_SECTOR_DES) as [Sec Type Description],
+     Trim(Trim(Ticker) & ' ' & Trim(MaturityDateExpirationDate)) as [Security Description],
+     $(fRound2(Commission_total_numeric)) as [Gross Comms],
+     $(fPrefixApos(CustomerAccountCounterparty)) as [Acct Short Description],
+     Trim(SecurityCurrencyISOCode) as [Currency],
+     Trim(BuySellCoverShortFlag) as [BuySell],
+     Trim(TradeAmount) as [TradeAmount],
+     '' as [GLCS CODE],
+     If(VersionCount > 1, 1, 0) as [_XML_ModifiedVersionChain]
+  RESIDENT _OFF0;
+  DROP TABLE _OFF0;
+
+  // exclude_xml_nonusd_from_output (L1781-1808)
+  ALERT_XML_NONUSD:
+  NoConcatenate
+  LOAD [As of trade date],[Client],[Security],[Trade Id],[Salesperson],[Production Earned],[Payout Earned],
+       [Trader Team Name],[Fidelity #],[ShortDesc],[TradeType],[Trade Date],[RR Team],[Source],[Sec Type],
+       [Sec Type Description],[Security Description],[Gross Comms],[Acct Short Description],[Currency],
+       [BuySell],[TradeAmount],[GLCS CODE],
+       $(fNormCurrency([Currency])) as Currency_norm,
+       If($(fNormCurrency([Currency]))='', 'XML_CURRENCY_BLANK_EXCLUDED', 'XML_CURRENCY_NONUSD_EXCLUDED') as alert_reason
+  RESIDENT XML_PAYOUT
+  WHERE $(fNormCurrency([Currency])) <> 'USD';
+
+  _XP2:
+  NoConcatenate LOAD * RESIDENT XML_PAYOUT
+  WHERE $(fNormCurrency([Currency])) = 'USD';
+  DROP TABLE XML_PAYOUT;
+  IF Alt(TableNumber('_XP2'), -1) >= 0 THEN
+    RENAME TABLE _XP2 TO XML_PAYOUT;
+  END IF
+ELSE
+  TRACE [CASTINE][WARN] 0 linhas XML mapeadas — parte XML do payout vazia (L3507-3510).;
+  IF Alt(TableNumber('XML_MAPPED'),-1) >= 0 THEN
+    DROP TABLE XML_MAPPED;
+  END IF
+END IF
+
+LET vXmlRowsKept = Alt(NoOfRows('XML_PAYOUT'), 0);
+LET vXmlNonUsdExcluded = Alt(NoOfRows('ALERT_XML_NONUSD'), 0);
+TRACE [CASTINE] XML rows kept: $(vXmlRowsKept) | NON-USD excluded: $(vXmlNonUsdExcluded);
+
+///$tab 08 — Repo (Broadridge)
+// ============================================================================
+// 08 — REPO: descoberta (find_repo_daily_file_in_date_folder L2318-2368),
+// leitura (L1986-2024), detecção de colunas (L2027-2072),
+// transformação (build_repo_official_output L2137-2314).
+// ============================================================================
+SET vRepoPath = '';
+
+// 1) nomes exatos: prefixo + yyyymmdd + ('', .csv, .txt)  (L2331-2337)
+FOR Each _pref in $(vRepoPrefixList)
+  FOR Each _extTok in 'NOEXT', '.csv', '.txt'
+    LET _ext = If('$(_extTok)'='NOEXT', '', '$(_extTok)');
+    IF Len('$(vRepoPath)') = 0 THEN
+      LET _cand = '$(vLibRepo)$(vPayoutYYYYMMDD)/$(_pref)$(vPayoutYYYYMMDD)$(_ext)';
+      IF Alt(FileSize('$(_cand)'), -1) >= 0 THEN
+        LET vRepoPath = '$(_cand)';
+      END IF
+    END IF
+  NEXT _extTok
+NEXT _pref
+
+// 2) varredura da pasta da data: prefixo + data nos dígitos do nome (L2339-2348)
+//    3) relaxa exigência da data (L2350-2358). Vence o de MAIOR mtime (empate: último).
+IF Len('$(vRepoPath)') = 0 THEN
+  FOR _pass = 1 to 2
+    IF Len('$(vRepoPath)') = 0 THEN
+      LET _bestTime = 0;
+      FOR Each _vF in FileList('$(vLibRepo)$(vPayoutYYYYMMDD)/*')
+        LET _vB = SubField(SubField('$(_vF)','\',-1),'/',-1);
+        LET _vExt = If(Index('$(_vB)','.')>0, Lower(Mid('$(_vB)', Index('$(_vB)','.',-1))), '');
+        IF Match('$(_vExt)', '', '.csv', '.txt') > 0 THEN
+          LET _hasPref = 0;
+          FOR Each _pref in $(vRepoPrefixList)
+            IF Lower(Left('$(_vB)', Len('$(_pref)'))) = Lower('$(_pref)') THEN
+              LET _hasPref = 1;
+            END IF
+          NEXT _pref
+          LET _digOK = If($(_pass)=1, If(Index(KeepChar('$(_vB)','0123456789'), '$(vPayoutYYYYMMDD)')>0, 1, 0), 1);
+          IF $(_hasPref) = 1 and $(_digOK) = 1 THEN
+            LET _ft = Alt(Num(FileTime('$(_vF)')), 0);
+            IF $(_ft) >= $(_bestTime) THEN
+              LET _bestTime = $(_ft);
+              LET vRepoPath = '$(_vF)';
+            END IF
+          END IF
+        END IF
+      NEXT _vF
+    END IF
+  NEXT _pass
+END IF
+
+SET vRepoRowsTotal = 0; SET vRepoEmptyRR = 0; SET vRepoWithSplit = 0;
+SET vRepoWithoutSplit = 0; SET vRepoDroppedTotal = 0;
+
+IF Len('$(vRepoPath)') = 0 THEN
+  TRACE [CASTINE][WARN] Repo diário não encontrado em $(vLibRepo)$(vPayoutYYYYMMDD)/ (L3561-3563).;
+ELSE
+  TRACE [CASTINE] Repo file: $(vRepoPath);
+
+  // --- delimitador: heurística da 1ª linha não-vazia (fallback do Python L1996-2002;
+  //     o primário csv.Sniffer não tem equivalente nativo — divergência documentada,
+  //     coberta pela reconciliação).
+  _RPROBE: FIRST 20 LOAD RecNo() as _rn, @1:n as _line FROM [$(vRepoPath)] (fix, codepage is 65001);
+  LET vRepoDelim = ',';
+  FOR _ri = 0 to Alt(NoOfRows('_RPROBE'),1) - 1
+    LET _vLine = Peek('_line', $(_ri), '_RPROBE');
+    IF Len(Trim('$(_vLine)')) > 0 THEN
+      LET _nC = SubStringCount('$(_vLine)', ',');
+      LET _nS = SubStringCount('$(_vLine)', ';');
+      LET _nP = SubStringCount('$(_vLine)', '|');
+      LET _nT = SubStringCount('$(_vLine)', Chr(9));
+      LET _mx = RangeMax($(_nC), $(_nS), $(_nP), $(_nT));
+      // ordem de desempate idêntica ao dict do Python: ',' ';' '|' '\t'
+      LET vRepoDelim = If($(_mx)=0, ',', If($(_nC)=$(_mx), ',', If($(_nS)=$(_mx), ';', If($(_nP)=$(_mx), '|', 'TAB'))));
+      EXIT FOR
+    END IF
+  NEXT _ri
+  IF Alt(TableNumber('_RPROBE'), -1) >= 0 THEN
+    DROP TABLE _RPROBE;
+  END IF
+  TRACE [CASTINE] Repo delimiter: [$(vRepoDelim)];
+
+  // --- cabeçalhos (p/ detect_repo_columns) -----------------------------------
+  IF '$(vRepoDelim)' = 'TAB' THEN
+    _RHDR: FIRST 1 LOAD * FROM [$(vRepoPath)] (txt, codepage is 65001, no labels, delimiter is '\t', msq);
+  ELSE
+    _RHDR: FIRST 1 LOAD * FROM [$(vRepoPath)] (txt, codepage is 65001, no labels, delimiter is '$(vRepoDelim)', msq);
+  END IF
+
+  // _pick_repo_col (L2027-2041): EXATO (1º da lista de exatos na ordem das colunas)
+  // senão CONTÉM. Implementado por chave:
+  SUB PickRepoCol(pExacts, pContains, pOutVar)
+    LET $(pOutVar) = '';
+    LET $(pOutVar)_ix = 0;
+    LET _lstE = Chr(39) & Replace('$(pExacts)', ';', Chr(39) & ',' & Chr(39)) & Chr(39);
+    FOR Each _wanted in $(_lstE)
+      IF Len('$($(pOutVar))') = 0 THEN
+        FOR _ci = 1 to NoOfFields('_RHDR')
+          LET _hv = Trim(Peek(FieldName($(_ci),'_RHDR'), 0, '_RHDR'));
+          LET _hn = KeepChar(Lower('$(_hv)'), 'abcdefghijklmnopqrstuvwxyz0123456789');
+          IF Len('$($(pOutVar))') = 0 and '$(_hn)' = '$(_wanted)' THEN
+            LET $(pOutVar) = '$(_hv)';
+            LET $(pOutVar)_ix = $(_ci);
+          END IF
+        NEXT _ci
+      END IF
+    NEXT _wanted
+    IF Len('$($(pOutVar))') = 0 THEN
+      LET _lstC = Chr(39) & Replace('$(pContains)', ';', Chr(39) & ',' & Chr(39)) & Chr(39);
+      FOR Each _wanted in $(_lstC)
+        IF Len('$($(pOutVar))') = 0 THEN
+          FOR _ci = 1 to NoOfFields('_RHDR')
+            LET _hv = Trim(Peek(FieldName($(_ci),'_RHDR'), 0, '_RHDR'));
+            LET _hn = KeepChar(Lower('$(_hv)'), 'abcdefghijklmnopqrstuvwxyz0123456789');
+            IF Len('$($(pOutVar))') = 0 and Index('$(_hn)', '$(_wanted)') > 0 THEN
+              LET $(pOutVar) = '$(_hv)';
+              LET $(pOutVar)_ix = $(_ci);
+            END IF
+          NEXT _ci
+        END IF
+      NEXT _wanted
+    END IF
+  END SUB
+
+  CALL PickRepoCol('td;tradedate;asoftradedate', 'td;tradedate', 'vRC_td');
+  CALL PickRepoCol('account;acct;accountname', 'account;acct', 'vRC_account');
+  CALL PickRepoCol('cusip', 'cusip', 'vRC_cusip');
+  CALL PickRepoCol('trans;transno;transnum;transnumber', 'trans', 'vRC_trans');
+  CALL PickRepoCol('salesperson;salespersonname', 'salesperson', 'vRC_sales');
+  CALL PickRepoCol('trader;tradername', 'trader', 'vRC_trader');
+  CALL PickRepoCol('trtype;tradetype', 'trtype;tradetype', 'vRC_trtype');
+  CALL PickRepoCol('assetclass;assettype', 'assetclass', 'vRC_asset');
+  CALL PickRepoCol('securitydescription;securitydesc', 'securitydescription;securitydesc', 'vRC_secdesc');
+  CALL PickRepoCol('netcredit;commission;grosscommission', 'netcredit', 'vRC_net');
+  CALL PickRepoCol('principal;tradeamount;paramount', 'principal;tradeamount', 'vRC_prin');
+  DROP TABLE _RHDR;
+  TRACE [CASTINE][REPO] td='$(vRC_td)' account='$(vRC_account)' cusip='$(vRC_cusip)' trans='$(vRC_trans)' sales='$(vRC_sales)' trader='$(vRC_trader)' trtype='$(vRC_trtype)' asset='$(vRC_asset)' secdesc='$(vRC_secdesc)' net='$(vRC_net)' principal='$(vRC_prin)';
+
+  // --- carga com rótulos por POSIÇÃO (@ix) — evita colisão de nomes ----------
+  SUB RepoColExpr(pIxVar, pOut)
+    IF Len('$($(pIxVar))') > 0 THEN
+      LET vRepoSel = '$(vRepoSel)' & If(Len('$(vRepoSel)')>0, ', ', '') & 'Trim(Text(@' & $($(pIxVar)_ix) & ')) as [' & '$(pOut)' & ']';
+    ELSE
+      LET vRepoSel = '$(vRepoSel)' & If(Len('$(vRepoSel)')>0, ', ', '') & 'Repeat(Chr(32),0) as [' & '$(pOut)' & ']';
+    END IF
+  END SUB
+  SET vRepoSel = '';
+  CALL RepoColExpr('vRC_td', 'T_D');
+  CALL RepoColExpr('vRC_account', 'Account');
+  CALL RepoColExpr('vRC_cusip', 'Cusip');
+  CALL RepoColExpr('vRC_trans', 'Trans');
+  CALL RepoColExpr('vRC_sales', 'RepoSalesPerson');
+  CALL RepoColExpr('vRC_trader', 'Trader');
+  CALL RepoColExpr('vRC_trtype', 'TR_TYPE');
+  CALL RepoColExpr('vRC_asset', 'AssetClass');
+  CALL RepoColExpr('vRC_secdesc', 'SecurityDescription');
+  CALL RepoColExpr('vRC_net', 'NetCredit_raw');
+  CALL RepoColExpr('vRC_prin', 'Principal');
+
+  IF '$(vRepoDelim)' = 'TAB' THEN
+    _REPO0: LOAD $(vRepoSel), RecNo() as __repo_rec
+    FROM [$(vRepoPath)] (txt, codepage is 65001, no labels, header is 1 lines, delimiter is '\t', msq);
+  ELSE
+    _REPO0: LOAD $(vRepoSel), RecNo() as __repo_rec
+    FROM [$(vRepoPath)] (txt, codepage is 65001, no labels, header is 1 lines, delimiter is '$(vRepoDelim)', msq);
+  END IF
+
+  LET vRepoRowsTotal = Alt(NoOfRows('_REPO0'), 0);
+  TRACE [CASTINE][REPO] rows_total: $(vRepoRowsTotal);
+
+  IF $(vRepoRowsTotal) = 0 and Alt(TableNumber('_REPO0'), -1) >= 0 THEN
+    DROP TABLE _REPO0;
+  END IF
+  IF $(vRepoRowsTotal) > 0 THEN
+  // --- trabalho: datas, chaves, valores (L2174-2196) --------------------------
+  CALL ParseDateColumn('_REPO0', 'T_D', '__td_dt');     // parse_date_to_datetime CUSTOM
+  CALL ParseCostColumn('_REPO0', 'NetCredit_raw', 'NetCredit_num');
+
+  _REPOB:
+  NoConcatenate
+  LOAD *,
+       $(fFmtMDY(SplitApplyDateNum)) as T_D_output
+  ;
+  LOAD *,
+       Trim(RepoSalesPerson) as [RR Team],
+       $(fNormTeam(RepoSalesPerson)) as RRTeam_norm,
+       Alt(Floor(__td_dt), $(vPayoutDateNum)) as SplitApplyDateNum,
+       SubField(SubField('$(vRepoPath)','\',-1),'/',-1) as repo_source_file,
+       __repo_rec as __src_id
+  RESIDENT _REPO0;
+  DROP TABLE _REPO0;
+  DROP FIELDS __td_dt, __repo_rec FROM _REPOB;
+
+  CALL ApplySplitDateAware('_REPOB');
+
+  // --- saída oficial do repo (L2270-2301) -------------------------------------
+  IF Alt(NoOfRows('_REPOB_MATCHED'), 0) > 0 THEN
+    REPO_PAYOUT:
+    NoConcatenate
+    LOAD
+       T_D_output as [As of trade date],
+       Account as [Client],
+       Cusip as [Security],
+       Trans as [Trade Id],
+       Trim(Salesperson_split_raw) & '' as [Salesperson],
+       $(fRound2(NetCredit_num * Split_num)) as [Production Earned],
+       $(fRound2(NetCredit_num * Split_num)) as [Payout Earned],
+       Trader as [Trader Team Name],
+       '' as [Fidelity #],
+       Trader as [ShortDesc],
+       TR_TYPE as [TradeType],
+       T_D_output as [Trade Date],
+       [RR Team],
+       '$(vRepoSource)' as [Source],
+       AssetClass as [Sec Type],
+       AssetClass as [Sec Type Description],
+       SecurityDescription as [Security Description],
+       $(fRound2(NetCredit_num)) as [Gross Comms],
+       $(fPrefixApos(Account)) as [Acct Short Description],
+       '$(vRepoCurrency)' as [Currency],
+       '$(vRepoBuySell)' as [BuySell],
+       Principal as [TradeAmount],
+       '' as [GLCS CODE]
+    RESIDENT _REPOB_MATCHED;
+    LET vRepoWithSplit = NoOfRows('REPO_PAYOUT');
+    DROP TABLE _REPOB_MATCHED;
+  ELSE
+    IF Alt(TableNumber('_REPOB_MATCHED'),-1) >= 0 THEN
+      DROP TABLE _REPOB_MATCHED;
+    END IF
+  END IF
+
+  // --- alertas do repo (build_repo_dropped_alerts L2085-2133) ----------------
+  IF Alt(TableNumber('_REPOB_DROPPED'), -1) >= 0 THEN
+    ALERT_REPO_UNMAPPED:
+    NoConcatenate
+    LOAD If(drop_reason='__SEED__', '__SEED__', Trans) as [Trade Id],
+         [RR Team],
+         '' as [Salesperson],
+         '' as [Split_raw],
+         Null() as [Split_num],
+         NetCredit_raw as [Net Credit],
+         NetCredit_num as [Net Credit numeric],
+         Account as [Account],
+         $(fPrefixApos(Cusip)) as [Cusip],
+         Trader as [Trader],
+         T_D_output as [T/D],
+         TR_TYPE as [TR/TYPE],
+         AssetClass as [AssetClass],
+         SecurityDescription as [SecurityDescription],
+         Principal as [Principal],
+         repo_source_file,
+         drop_reason
+    RESIDENT _REPOB_DROPPED;
+    LET vRepoDroppedTotal = NoOfRows('ALERT_REPO_UNMAPPED') - 1;   // -1 do seed
+    _tmpC: LOAD Count(If(drop_reason='RRTEAM_EMPTY',1)) as _c RESIDENT ALERT_REPO_UNMAPPED;
+    LET vRepoEmptyRR = Alt(Peek('_c',0,'_tmpC'),0); DROP TABLE _tmpC;
+    LET vRepoWithoutSplit = $(vRepoDroppedTotal) - $(vRepoEmptyRR);
+    DROP TABLE _REPOB_DROPPED;
+  END IF
+  END IF   // repo com linhas
+END IF
+
+LET vRepoWithSplit = Alt($(vRepoWithSplit), 0);
+TRACE [CASTINE][REPO] with_split=$(vRepoWithSplit) empty_rr=$(vRepoEmptyRR) without_split=$(vRepoWithoutSplit) dropped_total=$(vRepoDroppedTotal);
+
+///$tab 09 — Ajustes Manuais
+// ============================================================================
+// 09 — AJUSTES (find_adjustments_file L2458-2507, leitura L2510-2532,
+//      align_dataframe_to_final_output_columns L2535-2557,
+//      prepare_adjustments_output L2560-2601)
+// ============================================================================
+SET vAdjPath = '';
+SET vAdjRows = 0;
+
+// exatos: prefixo+data+ext -> prefixo+ext (L2471-2481)
+FOR Each _pref in $(vAdjPrefixList)
+  FOR Each _extTok in 'NOEXT', '.csv', '.txt', '.xlsx', '.xlsm', '.xls'
+    LET _ext = If('$(_extTok)'='NOEXT', '', '$(_extTok)');
+    IF Len('$(vAdjPath)') = 0 THEN
+      LET _cand = '$(vLibSalesData)$(_pref)$(vPayoutYYYYMMDD)$(_ext)';
+      IF Alt(FileSize('$(_cand)'), -1) >= 0 THEN
+        LET vAdjPath = '$(_cand)';
+      END IF
+    END IF
+  NEXT _extTok
+NEXT _pref
+IF Len('$(vAdjPath)') = 0 THEN
+  FOR Each _pref in $(vAdjPrefixList)
+    FOR Each _extTok in 'NOEXT', '.csv', '.txt', '.xlsx', '.xlsm', '.xls'
+      LET _ext = If('$(_extTok)'='NOEXT', '', '$(_extTok)');
+      IF Len('$(vAdjPath)') = 0 THEN
+        LET _cand = '$(vLibSalesData)$(_pref)$(_ext)';
+        IF Alt(FileSize('$(_cand)'), -1) >= 0 THEN
+          LET vAdjPath = '$(_cand)';
+        END IF
+      END IF
+    NEXT _extTok
+  NEXT _pref
+END IF
+// varredura: prefixo + data nos dígitos -> prefixo (mais recente por mtime; L2483-2507)
+IF Len('$(vAdjPath)') = 0 THEN
+  FOR _pass = 1 to 2
+    IF Len('$(vAdjPath)') = 0 THEN
+      LET _bestTime = 0;
+      FOR Each _vF in FileList('$(vLibSalesData)*')
+        LET _vB = SubField(SubField('$(_vF)','\',-1),'/',-1);
+        LET _vExt = If(Index('$(_vB)','.')>0, Lower(Mid('$(_vB)', Index('$(_vB)','.',-1))), '');
+        IF Match('$(_vExt)', '', '.csv', '.txt', '.xlsx', '.xlsm', '.xls') > 0 THEN
+          LET _hasPref = 0;
+          FOR Each _pref in $(vAdjPrefixList)
+            IF Lower(Left('$(_vB)', Len('$(_pref)'))) = Lower('$(_pref)') THEN
+              LET _hasPref = 1;
+            END IF
+          NEXT _pref
+          LET _digOK = If($(_pass)=1, If(Index(KeepChar('$(_vB)','0123456789'), '$(vPayoutYYYYMMDD)')>0, 1, 0), 1);
+          IF $(_hasPref) = 1 and $(_digOK) = 1 THEN
+            LET _ft = Alt(Num(FileTime('$(_vF)')), 0);
+            IF $(_ft) >= $(_bestTime) THEN
+              LET _bestTime = $(_ft);
+              LET vAdjPath = '$(_vF)';
+            END IF
+          END IF
+        END IF
+      NEXT _vF
+    END IF
+  NEXT _pass
+END IF
+
+IF Len('$(vAdjPath)') = 0 THEN
+  TRACE [CASTINE][ADJ][WARN] Nenhum arquivo de ajustes em Sales\Data (L3602-3603). Final = XML + Repo.;
+ELSE
+  TRACE [CASTINE][ADJ] Ajustes: $(vAdjPath);
+  LET _adjExt = Lower(Mid('$(vAdjPath)', Index('$(vAdjPath)','.',-1)));
+  SET ErrorMode = 0;
+  IF Match('$(_adjExt)', '.xlsx', '.xlsm', '.xls') > 0 THEN
+    // Python lê sheet_name=0; Qlik não indexa aba — tenta candidatos de vSplitSheetCandidates + 'Sheet1'
+    FOR Each _vSheet in $(vAdjSheetList)
+      IF Alt(TableNumber('_ADJ0'), -1) < 0 THEN
+        _ADJ0: LOAD * FROM [$(vAdjPath)] (ooxml, embedded labels, table is [$(_vSheet)]);
+      END IF
+    NEXT _vSheet
+  ELSE
+    // delimitador: mesma heurística do repo (adjustments_csv_delimiter=None -> autodetect)
+    _APROBE: FIRST 20 LOAD RecNo() as _rn, @1:n as _line FROM [$(vAdjPath)] (fix, codepage is 65001);
+    LET vAdjDelim = ',';
+    FOR _ri = 0 to Alt(NoOfRows('_APROBE'),1) - 1
+      LET _vLine = Peek('_line', $(_ri), '_APROBE');
+      IF Len(Trim('$(_vLine)')) > 0 THEN
+        LET _nC = SubStringCount('$(_vLine)', ','); LET _nS = SubStringCount('$(_vLine)', ';');
+        LET _nP = SubStringCount('$(_vLine)', '|'); LET _nT = SubStringCount('$(_vLine)', Chr(9));
+        LET _mx = RangeMax($(_nC), $(_nS), $(_nP), $(_nT));
+        LET vAdjDelim = If($(_mx)=0, ',', If($(_nC)=$(_mx), ',', If($(_nS)=$(_mx), ';', If($(_nP)=$(_mx), '|', 'TAB'))));
+        EXIT FOR
+      END IF
+    NEXT _ri
+    DROP TABLE _APROBE;
+    IF '$(vAdjDelim)' = 'TAB' THEN
+      CALL BuildTextSel('$(vAdjPath)', 'txt, codepage is 65001, embedded labels, delimiter is ''\t'', msq', 'vAdjTxt');
+      _ADJ0: LOAD $(vAdjTxt) FROM [$(vAdjPath)] (txt, codepage is 65001, embedded labels, delimiter is '\t', msq);
+    ELSE
+      CALL BuildTextSel('$(vAdjPath)', 'txt, codepage is 65001, embedded labels, delimiter is ''$(vAdjDelim)'', msq', 'vAdjTxt');
+      _ADJ0: LOAD $(vAdjTxt) FROM [$(vAdjPath)] (txt, codepage is 65001, embedded labels, delimiter is '$(vAdjDelim)', msq);
+    END IF
+  END IF
+  SET ErrorMode = 1;
+
+  IF Alt(TableNumber('_ADJ0'), -1) < 0 THEN
+    TRACE [CASTINE][ADJ][ERROR] Falha ao ler ajustes (L3613-3623). Ajustes vazios.;
+  ELSE
+    // align_dataframe_to_final_output_columns: header_norm -> coluna oficial.
+    // Colisão de 2 colunas para o mesmo destino = falha (espelha exceção no Python,
+    // engolida no call-site -> ajustes vazios).
+    SET vAdjSel = '';
+    SET vAdjDup = 0;
+    FOR Each _target in 'As of trade date','Client','Security','Trade Id','Salesperson','Production Earned','Payout Earned','Trader Team Name','Fidelity #','ShortDesc','TradeType','Trade Date','RR Team','Source','Sec Type','Sec Type Description','Security Description','Gross Comms','Acct Short Description','Currency','BuySell','TradeAmount','GLCS CODE'
+      LET _tn = KeepChar(Lower('$(_target)'), 'abcdefghijklmnopqrstuvwxyz0123456789');
+      LET _found = '';
+      LET _nfound = 0;
+      FOR _ci = 1 to NoOfFields('_ADJ0')
+        LET _cn = FieldName($(_ci), '_ADJ0');
+        LET _cnn = KeepChar(Lower('$(_cn)'), 'abcdefghijklmnopqrstuvwxyz0123456789');
+        IF '$(_cnn)' = '$(_tn)' THEN
+          LET _nfound = $(_nfound) + 1;
+          IF Len('$(_found)') = 0 THEN
+            LET _found = '$(_cn)';
+          END IF
+        END IF
+      NEXT _ci
+      IF $(_nfound) > 1 THEN
+        SET vAdjDup = 1;
+      END IF
+      LET vAdjSel = '$(vAdjSel)' & If(Len('$(vAdjSel)')>0, ', ', '') &
+        If(Len('$(_found)')>0, '[' & '$(_found)' & ']', 'Repeat(Chr(32),0)') & ' as [' & '$(_target)' & ']';
+    NEXT _target
+
+    IF '$(vAdjDup)' = '1' THEN
+      TRACE [CASTINE][ADJ][ERROR] Colunas duplicadas após normalização de header — ajustes descartados (paridade com exceção engolida no Python).;
+      DROP TABLE _ADJ0;
+    ELSE
+      ADJ_PAYOUT: NoConcatenate LOAD $(vAdjSel) RESIDENT _ADJ0;
+      DROP TABLE _ADJ0;
+      // monetários via parse_cost_original_to_float (L2554-2556)
+      CALL ParseCostColumn('ADJ_PAYOUT', 'Production Earned', '__adj_pe');
+      CALL ParseCostColumn('ADJ_PAYOUT', 'Payout Earned', '__adj_py');
+      CALL ParseCostColumn('ADJ_PAYOUT', 'Gross Comms', '__adj_gc');
+      _ADJ2:
+      NoConcatenate
+      LOAD [As of trade date],[Client],[Security],[Trade Id],[Salesperson],
+           __adj_pe as [Production Earned],
+           __adj_py as [Payout Earned],
+           [Trader Team Name],[Fidelity #],[ShortDesc],[TradeType],[Trade Date],[RR Team],[Source],
+           [Sec Type],[Sec Type Description],[Security Description],
+           __adj_gc as [Gross Comms],
+           [Acct Short Description],[Currency],[BuySell],[TradeAmount],[GLCS CODE]
+      RESIDENT ADJ_PAYOUT;
+      DROP TABLE ADJ_PAYOUT; RENAME TABLE _ADJ2 TO ADJ_PAYOUT;
+      LET vAdjRows = NoOfRows('ADJ_PAYOUT');
+    END IF
+  END IF
+END IF
+TRACE [CASTINE][ADJ] linhas de ajuste prontas: $(vAdjRows);
+
+///$tab 10 — Montagem Final & GLCS
+// ============================================================================
+// 10 — ORDEM EXATA do main() (L3626-3683):
+//   concat(XML+Repo) -> exclude_legacy_roll (GNCL/MULT/GNPL cross-year)
+//   -> append ajustes -> force Trade Date=AsOf p/ XML modificado
+//   -> exclui RR Team 235 / Client TEST -> populate GLCS CODE
+//   -> tabelas de e-mail GLCS -> coerção numérica -> drop coluna interna.
+// ============================================================================
+
+// --- concat XML + Repo (repo não tem a coluna interna -> null = não-modificado)
+IF Alt(NoOfRows('XML_PAYOUT'), 0) > 0 THEN
+  FINAL0: NoConcatenate LOAD * RESIDENT XML_PAYOUT;
+  DROP TABLE XML_PAYOUT;
+END IF
+IF Alt(NoOfRows('REPO_PAYOUT'), 0) > 0 THEN
+  IF Alt(TableNumber('FINAL0'), -1) >= 0 THEN
+    Concatenate(FINAL0) LOAD * RESIDENT REPO_PAYOUT;
+  ELSE
+    FINAL0: NoConcatenate LOAD * RESIDENT REPO_PAYOUT;
+  END IF
+  DROP TABLE REPO_PAYOUT;
+END IF
+
+// --- exclude_legacy_roll_shortdesc_records (L1813-1875) ----------------------
+// anos extraídos do TEXTO formatado via parser CUSTOM (inclui o quirk documentado)
+IF Alt(TableNumber('FINAL0'), -1) >= 0 THEN
+  CALL ParseDateColumn('FINAL0', 'As of trade date', '__asof_leg');
+  CALL ParseDateColumn('FINAL0', 'Trade Date', '__td_leg');
+
+  FINAL1:
+  NoConcatenate
+  LOAD *,
+       If(Len(__asof_leg)>0, Year(__asof_leg)) as __asof_year,
+       If(Len(__td_leg)>0, Year(__td_leg)) as __td_year,
+       Upper(Trim([ShortDesc])) as __sd_norm,
+       If( (Len(__asof_leg)=0 or Year(__asof_leg) <> $(vLegacyTradeYear))
+           and Len(__td_leg)>0 and Year(__td_leg) = $(vLegacyTradeYear)
+           and Match(Upper(Trim([ShortDesc])), 'GNCL', 'MULT', 'GNPL') > 0, 1, 0) as __legacy_excl
+  RESIDENT FINAL0;
+  DROP TABLE FINAL0;
+
+  ALERT_CROSSYEAR:
+  NoConcatenate
+  LOAD [As of trade date],[Client],[Security],[Trade Id],[Salesperson],[Production Earned],[Payout Earned],
+       [Trader Team Name],[Fidelity #],[ShortDesc],[TradeType],[Trade Date],[RR Team],[Source],[Sec Type],
+       [Sec Type Description],[Security Description],[Gross Comms],[Acct Short Description],[Currency],
+       [BuySell],[TradeAmount],[GLCS CODE],
+       If(Len(__asof_leg)>0, Date(__asof_leg,'YYYY-MM-DD'), '') as AsOfTradeDate_parsed,
+       If(Len(__td_leg)>0, Date(__td_leg,'YYYY-MM-DD'), '') as TradeDate_parsed,
+       __asof_year as AsOfTradeDate_year,
+       __td_year as TradeDate_year,
+       __sd_norm as ShortDesc_norm,
+       'ASOF_NOT_2026_TRADEDATE_2026_SHORTDESC_GNCL_MULT_GNPL_EXCLUDED' as alert_reason
+  RESIDENT FINAL1 WHERE __legacy_excl = 1;
+
+  FINAL2:
+  NoConcatenate LOAD * RESIDENT FINAL1 WHERE __legacy_excl = 0;
+  DROP TABLE FINAL1;
+  DROP FIELDS __asof_leg, __td_leg, __asof_year, __td_year, __sd_norm, __legacy_excl FROM FINAL2;
+END IF
+
+LET vGnclExcluded = Alt(NoOfRows('ALERT_CROSSYEAR'), 0);
+LET vCoreRows = Alt(NoOfRows('FINAL2'), 0);
+TRACE [CASTINE] Core após filtro GNCL/MULT/GNPL: $(vCoreRows) (excluídos: $(vGnclExcluded));
+
+// --- append ajustes (L3640) — DEPOIS do filtro legacy, ANTES do override -----
+IF Alt(NoOfRows('ADJ_PAYOUT'), 0) > 0 THEN
+  IF Alt(TableNumber('FINAL2'), -1) >= 0 THEN
+    Concatenate(FINAL2) LOAD * RESIDENT ADJ_PAYOUT;
+  ELSE
+    FINAL2: NoConcatenate LOAD * RESIDENT ADJ_PAYOUT;
+  END IF
+  DROP TABLE ADJ_PAYOUT;
+END IF
+
+IF Alt(TableNumber('FINAL2'), -1) < 0 THEN
+  TRACE [CASTINE][WARN] Universo final vazio (sem XML, Repo ou Ajustes). Tabela final não será criada — status registrado na auditoria.;
+END IF
+
+IF Alt(TableNumber('FINAL2'), -1) >= 0 THEN
+
+// --- force_modified_bloomberg_xml_trade_date_equal_asof (L1878-1911) ---------
+// só com a coluna interna presente (xml não-vazio); flag nulo = não-modificado
+IF Alt(FieldNumber('_XML_ModifiedVersionChain', 'FINAL2'), 0) > 0 THEN
+  FINAL3:
+  NoConcatenate
+  LOAD *,
+       If(Upper(Trim([Source])) = 'BLOOMBERG XML' and Alt([_XML_ModifiedVersionChain], 0) = 1,
+          Text([As of trade date]) & '', [Trade Date]) as [__TradeDate_final]
+  RESIDENT FINAL2;
+  DROP TABLE FINAL2;
+  _F3B:
+  NoConcatenate
+  LOAD [As of trade date],[Client],[Security],[Trade Id],[Salesperson],[Production Earned],[Payout Earned],
+       [Trader Team Name],[Fidelity #],[ShortDesc],[TradeType],
+       [__TradeDate_final] as [Trade Date],
+       [RR Team],[Source],[Sec Type],[Sec Type Description],[Security Description],[Gross Comms],
+       [Acct Short Description],[Currency],[BuySell],[TradeAmount],[GLCS CODE]
+  RESIDENT FINAL3;
+  DROP TABLE FINAL3;
+  RENAME TABLE _F3B TO FINAL3;
+ELSE
+  FINAL3: NoConcatenate LOAD * RESIDENT FINAL2; DROP TABLE FINAL2;
+END IF
+
+// --- exclude_rrteam_235_and_client_test (L2605-2666) -------------------------
+FINAL4:
+NoConcatenate
+LOAD *,
+     $(fNormTeam([RR Team])) as __rr_n,
+     $(fNormTeam([Client])) as __cl_n
+RESIDENT FINAL3;
+DROP TABLE FINAL3;
+
+ALERT_BUSINESS_EXCLUDED:
+NoConcatenate
+LOAD [As of trade date],[Client],[Security],[Trade Id],[Salesperson],[Production Earned],[Payout Earned],
+     [Trader Team Name],[Fidelity #],[ShortDesc],[TradeType],[Trade Date],[RR Team],[Source],[Sec Type],
+     [Sec Type Description],[Security Description],[Gross Comms],[Acct Short Description],[Currency],
+     [BuySell],[TradeAmount],[GLCS CODE],
+     __rr_n as RRTeam_norm_for_filter,
+     __cl_n as Client_norm_for_filter,
+     If('#' & __rr_n='#235' and __cl_n='TEST', 'RRTEAM_235_EXCLUDED;CLIENT_TEST_EXCLUDED',
+        If('#' & __rr_n='#235', 'RRTEAM_235_EXCLUDED', 'CLIENT_TEST_EXCLUDED')) as alert_reason
+RESIDENT FINAL4
+WHERE '#' & __rr_n = '#235' or __cl_n = 'TEST';
+
+FINAL5:
+NoConcatenate LOAD * RESIDENT FINAL4 WHERE '#' & __rr_n <> '#235' and __cl_n <> 'TEST';
+DROP TABLE FINAL4;
+DROP FIELDS __rr_n, __cl_n FROM FINAL5;
+
+LET vBusinessExcluded = Alt(NoOfRows('ALERT_BUSINESS_EXCLUDED'), 0);
+TRACE [CASTINE] Excluídos 235/TEST: $(vBusinessExcluded);
+
+///$tab 10b — Tiara & GLCS
+// ============================================================================
+// Tiara (L2672-3054) + populate_glcs_code (L3057-3199)
+// ============================================================================
+SET vTiaraAccountsFile = ''; SET vTiaraAccountsStatus = 'NOT_LOADED';
+SET vTiaraSubFile = '';      SET vTiaraSubStatus = 'NOT_LOADED';
+
+// SUB FindTiaraFile: prioridade (1) exato tiara.<family>*DDMMYYYY* por mtime;
+// (2) com data no nome <= data do processo (max data, desempate mtime);
+// (3) mais recente por mtime. (L2697-2752)
+SUB FindTiaraFile(pFamily, pOutVar)
+  LET $(pOutVar) = '';
+  LET _best = ''; LET _bestTime = -1;
+  FOR Each _vF in FileList('$(vLibTiara)*')
+    LET _vB = SubField(SubField('$(_vF)','\',-1),'/',-1);
+    IF Lower(Left('$(_vB)', Len('tiara.$(pFamily)'))) = 'tiara.$(pFamily)' and Index(KeepChar('$(_vB)','0123456789'), '$(vPayoutDateDDMMYYYY)') > 0 THEN
+      LET _ft = Alt(Num(FileTime('$(_vF)')), 0);
+      IF $(_ft) >= $(_bestTime) THEN
+        LET _bestTime = $(_ft); LET _best = '$(_vF)';
+      END IF
+    END IF
+  NEXT _vF
+  IF Len('$(_best)') > 0 THEN
+    LET $(pOutVar) = '$(_best)';
+  ELSE
+    // (2) datados <= processo: extrai 1ª run de 8 dígitos como DDMMYYYY
+    LET _bestDate = -1; LET _bestTime = -1; LET _best = '';
+    LET _fbTime = -1; LET _fb = '';
+    FOR Each _vF in FileList('$(vLibTiara)*')
+      LET _vB = SubField(SubField('$(_vF)','\',-1),'/',-1);
+      IF Lower(Left('$(_vB)', Len('tiara.$(pFamily)'))) = 'tiara.$(pFamily)' THEN
+        LET _ft = Alt(Num(FileTime('$(_vF)')), 0);
+        IF $(_ft) >= $(_fbTime) THEN
+          LET _fbTime = $(_ft); LET _fb = '$(_vF)';
+        END IF
+        CALL ExtractToken8('$(_vB)');          // -> vTok8 (1ª run de exatamente 8 dígitos)
+        LET _fd = Alt(Num(Date#('$(vTok8)', 'DDMMYYYY')), -1);
+        IF $(_fd) >= 0 and $(_fd) <= $(vPayoutDateNum) THEN
+          IF $(_fd) > $(_bestDate) or ($(_fd) = $(_bestDate) and $(_ft) >= $(_bestTime)) THEN
+            LET _bestDate = $(_fd); LET _bestTime = $(_ft); LET _best = '$(_vF)';
+          END IF
+        END IF
+      END IF
+    NEXT _vF
+    IF Len('$(_best)') > 0 THEN
+      LET $(pOutVar) = '$(_best)';
+    ELSEIF Len('$(_fb)') > 0 THEN
+      LET $(pOutVar) = '$(_fb)';
+    END IF
+  END IF
+END SUB
+
+// 1ª run de EXATAMENTE 8 dígitos (regex tiara\.<family>[_\-. ]*(\d{8}))
+SUB ExtractToken8(pName)
+  LET vTok8 = '';
+  LET _run = '';
+  FOR _i = 1 to Len('$(pName)') + 1
+    LET _ch = Mid('$(pName)', $(_i), 1);
+    IF Len('$(_ch)') > 0 and Index('0123456789', '$(_ch)') > 0 THEN
+      LET _run = '$(_run)$(_ch)';
+    ELSE
+      IF Len('$(_run)') = 8 and Len('$(vTok8)') = 0 THEN
+        LET vTok8 = '$(_run)';
+      END IF
+      LET _run = '';
+    END IF
+  NEXT _i
+END SUB
+
+CALL FindTiaraFile('accounts', 'vTiaraAccountsFile');
+CALL FindTiaraFile('subaccounts', 'vTiaraSubFile');
+TRACE [CASTINE][GLCS] accounts='$(vTiaraAccountsFile)' subaccounts='$(vTiaraSubFile)';
+
+// --- MAP_DIRECT / MAP_ACCTNR (load_tiara_accounts_glcs_lookup L2876-2980) ----
+// chaves por LINHA na ordem: acct_base, acct_noz, bbg_base, bbg_noz;
+// primeiro-vence (Mapping LOAD usa a 1ª ocorrência). Valor vazio de chave: fora.
+IF Len('$(vTiaraAccountsFile)') > 0 THEN
+  SET ErrorMode = 0;
+  CALL BuildTextSel('$(vTiaraAccountsFile)', 'txt, codepage is 65001, embedded labels, delimiter is ''|'', no quotes', 'vTiaSel');
+  _TIA0: LOAD $(vTiaSel), RecNo() as __tia_rec FROM [$(vTiaraAccountsFile)]
+         (txt, codepage is 65001, embedded labels, delimiter is '|', no quotes);
+  SET ErrorMode = 1;
+  IF Alt(TableNumber('_TIA0'), -1) < 0 THEN
+    SET vTiaraAccountsStatus = 'READ_ERROR';
+  ELSE
+    // localiza colunas por header_norm (EXATO; prioridade accountnr > accountno)
+    SET vTC_ent=''; SET vTC_anr=''; SET vTC_bbg='';
+    FOR _ci = 1 to NoOfFields('_TIA0')
+      LET _cn = FieldName($(_ci), '_TIA0');
+      LET _nn = KeepChar(Lower('$(_cn)'), 'abcdefghijklmnopqrstuvwxyz0123456789');
+      IF '$(_nn)' = 'entitycode' and Len('$(vTC_ent)') = 0 THEN
+        LET vTC_ent = '$(_cn)';
+      END IF
+      IF Match('$(_nn)', 'accountnr', 'accountno') > 0 and Len('$(vTC_anr)') = 0 THEN
+        LET vTC_anr = '$(_cn)';
+      END IF
+      IF Match('$(_nn)', 'bloombergmasteraccountno', 'masterbloombergaccount') > 0 and Len('$(vTC_bbg)') = 0 THEN
+        LET vTC_bbg = '$(_cn)';
+      END IF
+    NEXT _ci
+
+    IF Len('$(vTC_ent)') = 0 THEN
+      SET vTiaraAccountsStatus = 'MISSING_ENTITY_CODE_COLUMN';
+      DROP TABLE _TIA0;
+    ELSEIF Len('$(vTC_anr)') = 0 and Len('$(vTC_bbg)') = 0 THEN
+      SET vTiaraAccountsStatus = 'MISSING_LOOKUP_COLUMNS';
+      DROP TABLE _TIA0;
+    ELSE
+      _TIA1:
+      NoConcatenate
+      LOAD __tia_rec,
+           Trim(Text([$(vTC_ent)])) as __ent,
+           $(=If(Len('$(vTC_anr)')>0, 'Text([' & '$(vTC_anr)' & '])', 'Null()')) as __anr_raw,
+           $(=If(Len('$(vTC_bbg)')>0, 'Text([' & '$(vTC_bbg)' & '])', 'Null()')) as __bbg_raw
+      RESIDENT _TIA0 WHERE Len(Trim(Text([$(vTC_ent)]))) > 0;
+      DROP TABLE _TIA0;
+      CALL NormAcctColumns('_TIA1', '__anr_raw', '__anr_base', '__anr_noz');
+      CALL NormAcctColumns('_TIA1', '__bbg_raw', '__bbg_base', '__bbg_noz');
+
+      _TIAKEYS:
+      LOAD 0 as __tia_rec, 0 as __seq, '§none§' as __key, '' as __ent, 'ANR' as __src AUTOGENERATE 1;
+      Concatenate(_TIAKEYS)
+      LOAD __tia_rec, 1 as __seq, __anr_base as __key, __ent, 'ANR' as __src RESIDENT _TIA1 WHERE Len(__anr_base) > 0;
+      Concatenate(_TIAKEYS) LOAD __tia_rec, 2 as __seq, __anr_noz as __key, __ent, 'ANR' as __src RESIDENT _TIA1 WHERE Len(__anr_noz) > 0;
+      Concatenate(_TIAKEYS) LOAD __tia_rec, 3 as __seq, __bbg_base as __key, __ent, 'BBG' as __src RESIDENT _TIA1 WHERE Len(__bbg_base) > 0;
+      Concatenate(_TIAKEYS) LOAD __tia_rec, 4 as __seq, __bbg_noz as __key, __ent, 'BBG' as __src RESIDENT _TIA1 WHERE Len(__bbg_noz) > 0;
+      DROP TABLE _TIA1;
+
+      SET vTiaraAccountsStatus = 'OK';
+    END IF
+  END IF
+ELSE
+  SET vTiaraAccountsStatus = 'FILE_NOT_FOUND';
+END IF
+
+// ponto único de criação dos mapas de accounts (seed '§none§' sempre presente)
+IF Alt(TableNumber('_TIAKEYS'), -1) < 0 THEN
+  _TIAKEYS:
+  LOAD 0 as __tia_rec, 0 as __seq, '§none§' as __key, '' as __ent, 'ANR' as __src AUTOGENERATE 1;
+END IF
+MAP_DIRECT:
+Mapping LOAD __key, __ent RESIDENT _TIAKEYS ORDER BY __tia_rec, __seq;
+MAP_ACCTNR:
+Mapping LOAD __key, __ent RESIDENT _TIAKEYS WHERE __src = 'ANR' ORDER BY __tia_rec, __seq;
+DROP TABLE _TIAKEYS;
+
+// --- MAP_SUB (load_tiara_subaccounts_parent_lookup L2983-3054) ---------------
+IF Len('$(vTiaraSubFile)') > 0 THEN
+  SET ErrorMode = 0;
+  CALL BuildTextSel('$(vTiaraSubFile)', 'txt, codepage is 65001, embedded labels, delimiter is ''|'', no quotes', 'vSubSel');
+  _SUB0: LOAD $(vSubSel), RecNo() as __sub_rec FROM [$(vTiaraSubFile)]
+         (txt, codepage is 65001, embedded labels, delimiter is '|', no quotes);
+  SET ErrorMode = 1;
+  IF Alt(TableNumber('_SUB0'), -1) < 0 THEN
+    SET vTiaraSubStatus = 'READ_ERROR';
+  ELSE
+    SET vTS_acc=''; SET vTS_sub='';
+    FOR _ci = 1 to NoOfFields('_SUB0')
+      LET _cn = FieldName($(_ci), '_SUB0');
+      LET _nn = KeepChar(Lower('$(_cn)'), 'abcdefghijklmnopqrstuvwxyz0123456789');
+      IF Match('$(_nn)', 'accountno', 'accountnr') > 0 and Len('$(vTS_acc)') = 0 THEN
+        LET vTS_acc = '$(_cn)';
+      END IF
+      IF Match('$(_nn)', 'subacctno', 'subaccountno', 'subaccountnr') > 0 and Len('$(vTS_sub)') = 0 THEN
+        LET vTS_sub = '$(_cn)';
+      END IF
+    NEXT _ci
+    IF Len('$(vTS_sub)') = 0 THEN
+      SET vTiaraSubStatus = 'MISSING_SUBACCT_NO_COLUMN'; DROP TABLE _SUB0;
+    ELSEIF Len('$(vTS_acc)') = 0 THEN
+      SET vTiaraSubStatus = 'MISSING_ACCOUNT_NO_COLUMN'; DROP TABLE _SUB0;
+    ELSE
+      _SUB1:
+      NoConcatenate
+      LOAD __sub_rec,
+           Text([$(vTS_sub)]) as __sub_raw,
+           Text([$(vTS_acc)]) as __acc_raw
+      RESIDENT _SUB0;
+      DROP TABLE _SUB0;
+      CALL NormAcctColumns('_SUB1', '__sub_raw', '__sub_base', '__sub_noz');
+      CALL NormAcctColumns('_SUB1', '__acc_raw', '__acc_base', '__acc_noz');
+
+      // valor embala RawSub|RawAcct (campos do alerta) — L3042-3046
+      _SUBKEYS:
+      LOAD 0 as __sub_rec, 0 as __seq, '§none§' as __key, '@@MISS@@' as __val AUTOGENERATE 1;
+      Concatenate(_SUBKEYS)
+      LOAD __sub_rec, 1 as __seq, __sub_base as __key,
+           Trim(__sub_raw) & '|§|' & Trim(__acc_raw) as __val
+      RESIDENT _SUB1 WHERE Len(__acc_base) > 0 and Len(__sub_base) > 0;
+      Concatenate(_SUBKEYS)
+      LOAD __sub_rec, 2 as __seq, __sub_noz as __key,
+           Trim(__sub_raw) & '|§|' & Trim(__acc_raw) as __val
+      RESIDENT _SUB1 WHERE Len(__acc_base) > 0 and Len(__sub_noz) > 0;
+      DROP TABLE _SUB1;
+      SET vTiaraSubStatus = 'OK';
+    END IF
+  END IF
+ELSE
+  SET vTiaraSubStatus = 'FILE_NOT_FOUND';
+END IF
+
+// ponto único de criação do mapa de subaccounts
+IF Alt(TableNumber('_SUBKEYS'), -1) < 0 THEN
+  _SUBKEYS:
+  LOAD 0 as __sub_rec, 0 as __seq, '§none§' as __key, '@@MISS@@' as __val AUTOGENERATE 1;
+END IF
+MAP_SUB: Mapping LOAD __key, __val RESIDENT _SUBKEYS ORDER BY __sub_rec, __seq;
+DROP TABLE _SUBKEYS;
+TRACE [CASTINE][GLCS] accounts_status=$(vTiaraAccountsStatus) sub_status=$(vTiaraSubStatus);
+
+// --- populate_glcs_code (L3057-3199) -----------------------------------------
+// Só linhas Source='BLOOMBERG XML'. Letras -> cópia; numérico -> direct -> sub.
+// Sem match: MANTÉM GLCS pré-existente e gera alerta.
+IF Alt(NoOfRows('FINAL5'), 0) > 0 THEN
+CALL NormAcctColumns('FINAL5', 'Acct Short Description', '__g_base', '__g_noz');
+
+FINAL6B:
+NoConcatenate
+LOAD *,
+     If(__g_is_xml = 1,
+        If(Len(__g_clean)>0 and Len(KeepChar(Upper(__g_clean),'ABCDEFGHIJKLMNOPQRSTUVWXYZ'))>0,
+           __g_clean,                                                   // alfanumérico: cópia direta
+           If(Len(__g_base)=0, [GLCS CODE],                             // sem chave numérica: inalterado
+              If(__g_direct <> '@@MISS@@', __g_direct,
+                 If(__g_subent <> '@@MISS@@', __g_subent, [GLCS CODE])))),
+        [GLCS CODE]) as [__GLCS_final],
+     If(__g_is_xml = 1 and Len(__g_base)>0 and __g_direct = '@@MISS@@' and __g_subent = '@@MISS@@'
+        and not (Len(__g_clean)>0 and Len(KeepChar(Upper(__g_clean),'ABCDEFGHIJKLMNOPQRSTUVWXYZ'))>0), 1, 0) as __g_unmatched;
+LOAD *,
+     // passo 2: subaccounts -> ACCOUNT_NO -> accounts ACCOUNTNR (variantes base0/noz0)
+     If(__g_is_xml = 1 and Len(__g_sub_acct_base0)>0,
+        ApplyMap('MAP_ACCTNR', __g_sub_acct_base0,
+           ApplyMap('MAP_ACCTNR', __g_sub_acct_noz0, '@@MISS@@')),
+        '@@MISS@@') as __g_subent;
+LOAD *,
+     If(Len(__g_sub_acct_base0)=0, '',
+        If(FindOneOf(__g_sub_acct_base0,'123456789')=0, '0',
+           Mid(__g_sub_acct_base0, FindOneOf(__g_sub_acct_base0,'123456789')))) as __g_sub_acct_noz0;
+LOAD *,
+     // normaliza ACCOUNT_NO do subaccount (equivale a _numeric_account_lookup_variants)
+     If(Len(__g_sub_acct_c)=0 or Len(KeepChar(Upper(__g_sub_acct_c),'ABCDEFGHIJKLMNOPQRSTUVWXYZ'))>0, '',
+        KeepChar(If(SubStringCount(__g_sub_acct_c,'.')=1
+                    and Len(SubField(__g_sub_acct_c,'.',1))>0
+                    and Len(KeepChar(SubField(__g_sub_acct_c,'.',1),'0123456789'))=Len(SubField(__g_sub_acct_c,'.',1))
+                    and Len(SubField(__g_sub_acct_c,'.',2))>0
+                    and Len(PurgeChar(SubField(__g_sub_acct_c,'.',2),'0'))=0,
+                    SubField(__g_sub_acct_c,'.',1), __g_sub_acct_c), '0123456789')) as __g_sub_acct_base0;
+LOAD *,
+     If(__g_subraw <> '@@MISS@@',
+        Trim(PurgeChar(Trim(Replace(Replace(Replace(SubField(__g_subraw,'|§|',2),Chr(160),' '),Chr(8203),''),Chr(65279),'')), '"'&Chr(39))),
+        '') as __g_sub_acct_c,
+     If(__g_subraw <> '@@MISS@@', SubField(__g_subraw, '|§|', 1), '') as __g_sub_no,
+     If(__g_subraw <> '@@MISS@@', SubField(__g_subraw, '|§|', 2), '') as __g_sub_acct;
+LOAD *,
+     // passo 1: direct lookup (variantes base, depois noz) — primeiro-vence do mapa
+     If(__g_is_xml = 1 and Len(__g_base)>0,
+        ApplyMap('MAP_DIRECT', __g_base, ApplyMap('MAP_DIRECT', __g_noz, '@@MISS@@')),
+        '@@MISS@@') as __g_direct,
+     // fallback: subaccounts pelas mesmas variantes
+     If(__g_is_xml = 1 and Len(__g_base)>0,
+        ApplyMap('MAP_SUB', __g_base, ApplyMap('MAP_SUB', __g_noz, '@@MISS@@')),
+        '@@MISS@@') as __g_subraw;
+LOAD *,
+     If(Upper(Trim([Source])) = 'BLOOMBERG XML', 1, 0) as __g_is_xml,
+     // _clean_account_short_description_for_glcs (L2844-2860)
+     If(Len(Trim(Text([Acct Short Description])))=0
+        or Match(Lower(Trim(Text([Acct Short Description]))),'nan','none','null','nat')>0, '',
+        Trim(PurgeChar(Trim(Replace(Replace(Replace(Text([Acct Short Description]),Chr(160),' '),Chr(8203),''),Chr(65279),'')), '"'&Chr(39)))) as __g_clean
+RESIDENT FINAL5;
+DROP TABLE FINAL5;
+
+// alerta GLCS unmapped (colunas L3082-3096; Direct* sempre vazios — fiel)
+ALERT_GLCS_UNMAPPED:
+NoConcatenate
+LOAD [As of trade date],[Client],[Security],[Trade Id],[Salesperson],[Production Earned],[Payout Earned],
+     [Trader Team Name],[Fidelity #],[ShortDesc],[TradeType],[Trade Date],[RR Team],[Source],[Sec Type],
+     [Sec Type Description],[Security Description],[Gross Comms],[Acct Short Description],[Currency],
+     [BuySell],[TradeAmount],
+     [__GLCS_final] as [GLCS CODE],
+     Text([Acct Short Description]) as LookupAccountShortDescription,
+     __g_base as LookupAccountNormalized,
+     'TIARA_ACCOUNTS_DIRECT_THEN_TIARA_SUBACCOUNTS_FALLBACK' as LookupPathTried,
+     '' as DirectTiaraMatchField,
+     '' as DirectTiaraMatchValue,
+     __g_sub_no as SubacctNoMatched,
+     __g_sub_acct as SubacctAccountNo,
+     __g_sub_acct_base0 as SubacctAccountNoNormalized,
+     '$(vTiaraAccountsFile)' as TiaraAccountsFile,
+     '$(vTiaraAccountsStatus)' as TiaraAccountsLookupStatus,
+     '$(vTiaraSubFile)' as TiaraSubaccountsFile,
+     '$(vTiaraSubStatus)' as TiaraSubaccountsLookupStatus,
+     If(Len(__g_sub_no)>0,
+        'SUBACCOUNT_FOUND_BUT_PARENT_ACCOUNT_NO_NOT_FOUND_IN_TIARA_ACCOUNTS_ACCOUNTNR',
+        'NUMERIC_XML_ACCOUNT_SHORT_DESCRIPTION_NOT_FOUND_IN_TIARA_ACCOUNTS_OR_TIARA_SUBACCOUNTS') as alert_reason
+RESIDENT FINAL6B WHERE __g_unmatched = 1;
+
+// tabela final pré-oficial
+FINAL7:
+NoConcatenate
+LOAD [As of trade date],[Client],[Security],[Trade Id],[Salesperson],
+     [Production Earned],[Payout Earned],[Trader Team Name],[Fidelity #],[ShortDesc],
+     [TradeType],[Trade Date],[RR Team],[Source],[Sec Type],[Sec Type Description],
+     [Security Description],[Gross Comms],[Acct Short Description],[Currency],[BuySell],
+     [TradeAmount],
+     [__GLCS_final] as [GLCS CODE]
+RESIDENT FINAL6B;
+DROP TABLE FINAL6B;
+
+// --- tabelas do e-mail GLCS (L3202-3275) --------------------------------------
+GLCS_EMAIL_UNMATCHED:
+LOAD Distinct
+     Trim([Client]) as [Client Short Name],
+     Trim(Text([Acct Short Description])) as [Master Account Number]
+RESIDENT FINAL7
+WHERE Upper(Trim([Source])) = 'BLOOMBERG XML'
+  and Len(Trim(Text([GLCS CODE]))) = 0
+  and Len(Trim(Text([Acct Short Description]))) > 0
+  and Len(KeepChar(
+        If(Len(Trim(Text([Acct Short Description])))=0 or Match(Lower(Trim(Text([Acct Short Description]))),'nan','none','null','nat')>0, '',
+           Trim(PurgeChar(Trim(Replace(Replace(Replace(Text([Acct Short Description]),Chr(160),' '),Chr(8203),''),Chr(65279),'')), '"'&Chr(39)))),
+        '0123456789'))
+      = Len(If(Len(Trim(Text([Acct Short Description])))=0 or Match(Lower(Trim(Text([Acct Short Description]))),'nan','none','null','nat')>0, '',
+           Trim(PurgeChar(Trim(Replace(Replace(Replace(Text([Acct Short Description]),Chr(160),' '),Chr(8203),''),Chr(65279),'')), '"'&Chr(39)))))
+  and Len(If(Len(Trim(Text([Acct Short Description])))=0 or Match(Lower(Trim(Text([Acct Short Description]))),'nan','none','null','nat')>0, '',
+           Trim(PurgeChar(Trim(Replace(Replace(Replace(Text([Acct Short Description]),Chr(160),' '),Chr(8203),''),Chr(65279),'')), '"'&Chr(39))))) > 0;
+
+GLCS_EMAIL_SUSPICIOUS:
+LOAD Distinct
+     Trim([Client]) as [Client Short Name],
+     Trim(Text([Acct Short Description])) as [Master Account Number],
+     Trim(Replace(Replace(Trim(Text([GLCS CODE])), Chr(39), ''), '"', '')) as [GLCS CODE],
+     'GLCS code does not appear to be correct in Tiara: numeric and longer than 8 digits' as [Issue]
+RESIDENT FINAL7
+WHERE Upper(Trim([Source])) = 'BLOOMBERG XML'
+  and Len(Trim(Replace(Replace(Trim(Text([GLCS CODE])), Chr(39), ''), '"', ''))) >= 9
+  and Len(KeepChar(Trim(Replace(Replace(Trim(Text([GLCS CODE])), Chr(39), ''), '"', '')), '0123456789'))
+      = Len(Trim(Replace(Replace(Trim(Text([GLCS CODE])), Chr(39), ''), '"', '')));
+
+// ============================================================================
+// TABELA FINAL — BLOOMBERG_FINAL_PYTHON_PARITY (23 colunas oficiais, L3678-3683)
+// Monetários numéricos (coerção pd.to_numeric) — CSV de referência usa %.2f.
+// ============================================================================
+BLOOMBERG_FINAL_PYTHON_PARITY:
+NoConcatenate
+LOAD [As of trade date],
+     [Client],
+     [Security],
+     [Trade Id],
+     [Salesperson],
+     Num#(Text([Production Earned])) as [Production Earned],
+     Num#(Text([Payout Earned])) as [Payout Earned],
+     [Trader Team Name],
+     [Fidelity #],
+     [ShortDesc],
+     [TradeType],
+     [Trade Date],
+     [RR Team],
+     [Source],
+     [Sec Type],
+     [Sec Type Description],
+     [Security Description],
+     Num#(Text([Gross Comms])) as [Gross Comms],
+     [Acct Short Description],
+     [Currency],
+     [BuySell],
+     [TradeAmount],
+     [GLCS CODE]
+RESIDENT FINAL7;
+DROP TABLE FINAL7;
+
+LET vFinalRows = Alt(NoOfRows('BLOOMBERG_FINAL_PYTHON_PARITY'), 0);
+TRACE [CASTINE] FINAL rows: $(vFinalRows);
+END IF   // FINAL5 com linhas
+END IF   // universo final não-vazio (guard F19d)
+
+///$tab 11 — Auditoria & Exportação
+// ============================================================================
+// 11 — AUDIT_ETAPAS: contadores 1:1 com o stdout do Python (prompt §12).
+// A reconciliação compara com tests/expected/stage_counts.json para localizar
+// a PRIMEIRA etapa divergente. STOREs opcionais espelham os CSVs do Python.
+// ============================================================================
+LET vSplitDistinctTeams = 0;
+IF '$(vSplitOK)' = '1' THEN
+  _tmpD: LOAD Count(Distinct RRTeam_norm) as _d RESIDENT SPLIT_VALID;
+  LET vSplitDistinctTeams = Alt(Peek('_d',0,'_tmpD'),0); DROP TABLE _tmpD;
+END IF
+LET vSplitConfigAlertsN = Alt(NoOfRows('SPLIT_CONFIG_ALERTS'),1) - 1;              // -1 seed
+LET vTeamMismatchKeys  = If(Alt(TableNumber('TEAM_MISMATCH'),-1)<0, 0, NoOfRows('TEAM_MISMATCH') - 1);   // -1 do seed
+LET vGlcsUnmappedN     = If(Alt(TableNumber('ALERT_GLCS_UNMAPPED'),-1)<0, 0, NoOfRows('ALERT_GLCS_UNMAPPED'));
+LET vGlcsEmailN        = If(Alt(TableNumber('GLCS_EMAIL_UNMATCHED'),-1)<0, 0, NoOfRows('GLCS_EMAIL_UNMATCHED'));
+LET vGlcsSuspN         = If(Alt(TableNumber('GLCS_EMAIL_SUSPICIOUS'),-1)<0, 0, NoOfRows('GLCS_EMAIL_SUSPICIOUS'));
+LET vCrossyearN        = If(Alt(TableNumber('ALERT_CROSSYEAR'),-1)<0, 0, NoOfRows('ALERT_CROSSYEAR'));
+LET vFinalRows         = If(Alt(TableNumber('BLOOMBERG_FINAL_PYTHON_PARITY'),-1)<0, 0, NoOfRows('BLOOMBERG_FINAL_PYTHON_PARITY'));
+LET vReloadTs          = Timestamp(Now(), 'YYYY-MM-DD hh:mm:ss');
+
+AUDIT_ETAPAS:
+LOAD * INLINE [audit_ordem, audit_etapa, audit_valor
+1, payout_yyyymmdd, $(vPayoutYYYYMMDD)
+2, arquivos_xml_processados, $(vNumXmlFiles)
+3, total_trades_parsed_raw, $(vTotalTradesParsed)
+4, rows_loaded_df_raw, $(vTotalTradesParsed)
+5, rows_after_versioning, $(vRowsAfterVersioning)
+6, rows_after_remove_cancels, $(vRowsAfterCancels)
+7, cancels_removed, $(vCancelsRemoved)
+8, split_ok, $(vSplitOK)
+9, split_rows_read, $(vSplitRowsRead)
+10, split_usable_rows, $(vSplitUsableRows)
+11, split_valid_rows, $(vSplitValidRows)
+12, split_distinct_teams, $(vSplitDistinctTeams)
+13, split_config_alerts, $(vSplitConfigAlertsN)
+14, xml_rows_before_split_merge, $(vRowsAfterCancels)
+15, xml_rows_mapped, $(vXmlRowsMapped)
+16, xml_rows_dropped_unmapped, $(vXmlRowsDropped)
+17, repo_rows_total, $(vRepoRowsTotal)
+18, repo_rows_empty_rr, $(vRepoEmptyRR)
+19, repo_rows_with_split, $(vRepoWithSplit)
+20, repo_rows_without_split, $(vRepoWithoutSplit)
+21, adj_rows_appended, $(vAdjRows)
+22, xml_rows_kept, $(vXmlRowsKept)
+23, xml_rows_nonusd_excluded, $(vXmlNonUsdExcluded)
+24, repo_rows_kept, $(vRepoWithSplit)
+25, core_rows_after_gncl_filter, $(vCoreRows)
+26, gncl_mult_excluded, $(vCrossyearN)
+27, adjustments_rows_appended, $(vAdjRows)
+28, final_rows, $(vFinalRows)
+29, xml_dropped_alerts, $(vXmlRowsDropped)
+30, repo_dropped_alerts, $(vRepoDroppedTotal)
+31, team_mismatch_keys, $(vTeamMismatchKeys)
+32, business_excluded_235_test, $(vBusinessExcluded)
+33, glcs_unmapped_alerts, $(vGlcsUnmappedN)
+34, glcs_email_rows, $(vGlcsEmailN)
+35, glcs_suspicious_rows, $(vGlcsSuspN)
+36, tiara_accounts_status, $(vTiaraAccountsStatus)
+37, tiara_subaccounts_status, $(vTiaraSubStatus)
+38, reload_timestamp, $(vReloadTs)
+];
+
+// Status de carga: NÃO declarar sucesso com erro material (prompt §12)
+LET vParityStatus = If($(vFinalRows) > 0, 'LOADED_OK_PENDING_RECONCILIATION', 'LOADED_EMPTY_CHECK_INPUTS');
+Concatenate(AUDIT_ETAPAS)
+LOAD 99 as audit_ordem, 'status_carga' as audit_etapa, '$(vParityStatus)' as audit_valor AUTOGENERATE 1;
+TRACE [CASTINE] STATUS: $(vParityStatus);
+
+// ---------------------------------------------------------------------------
+// EXPORTAÇÃO (vStoreOutputs=1): espelha os arquivos do Python (main L3722-3786)
+// Final: monetários com 2 casas (%.2f). Alertas: mesmos nomes de arquivo.
+// Ordenação dos CSVs de alerta segue as chaves do pandas; diferenças de collation
+// texto são cosméticas — o comparador é por chave (ver 04_DATA_RECONCILIATION).
+// ---------------------------------------------------------------------------
+IF '$(vStoreOutputs)' = '1' THEN
+  IF $(vFinalRows) > 0 THEN
+    _EXPORT_FINAL:
+    NoConcatenate
+    LOAD [As of trade date],[Client],[Security],[Trade Id],[Salesperson],
+         If(Len([Production Earned])=0, '', Text(Num($(fRound2([Production Earned])), '0.00', '.', ''))) as [Production Earned],
+         If(Len([Payout Earned])=0, '', Text(Num($(fRound2([Payout Earned])), '0.00', '.', ''))) as [Payout Earned],
+         [Trader Team Name],[Fidelity #],[ShortDesc],[TradeType],[Trade Date],[RR Team],[Source],
+         [Sec Type],[Sec Type Description],[Security Description],
+         If(Len([Gross Comms])=0, '', Text(Num($(fRound2([Gross Comms])), '0.00', '.', ''))) as [Gross Comms],
+         [Acct Short Description],[Currency],[BuySell],[TradeAmount],[GLCS CODE]
+    RESIDENT BLOOMBERG_FINAL_PYTHON_PARITY;
+    STORE _EXPORT_FINAL INTO [$(vLibOutput)PPT_DailyExportOfPayout_$(vPayoutYYYYMMDD).csv] (txt);
+    DROP TABLE _EXPORT_FINAL;
+    STORE BLOOMBERG_FINAL_PYTHON_PARITY INTO [$(vLibOutput)BLOOMBERG_FINAL_PYTHON_PARITY.qvd] (qvd);
+  END IF
+
+  SUB StoreAlert(pTable, pFile, pSeedField)
+    IF Alt(TableNumber('$(pTable)'), -1) >= 0 THEN
+      _EXP_A: NoConcatenate LOAD * RESIDENT [$(pTable)]
+              WHERE [$(pSeedField)] <> '__SEED__';
+      IF Alt(NoOfRows('_EXP_A'), 0) > 0 THEN
+        STORE _EXP_A INTO [$(vLibOutput)$(pFile)] (txt);
+      ELSE
+        STORE [$(pTable)] INTO [$(vLibOutput)$(pFile)] (txt);
+      END IF
+      IF Alt(TableNumber('_EXP_A'), -1) >= 0 THEN
+        DROP TABLE _EXP_A;
+      END IF
+    END IF
+  END SUB
+
+  CALL StoreAlert('ALERT_SPLIT_UNMAPPED', 'split_unmapped_alerts.csv', 'drop_reason');
+  CALL StoreAlert('ALERT_REPO_UNMAPPED', 'repo_unmapped_alerts.csv', 'drop_reason');
+  CALL StoreAlert('SPLIT_CONFIG_ALERTS', 'split_matrix_config_alerts.csv', 'alert_type');
+  IF Alt(TableNumber('TEAM_MISMATCH'),-1) >= 0 THEN
+    CALL StoreAlert('TEAM_MISMATCH', 'split_team_mismatch_alerts.csv', 'side');
+  END IF
+  IF Alt(TableNumber('ALERT_XML_NONUSD'),-1) >= 0 THEN
+    STORE ALERT_XML_NONUSD INTO [$(vLibOutput)xml_nonusd_excluded_alerts.csv] (txt);
+  END IF
+  IF Alt(TableNumber('ALERT_CROSSYEAR'),-1) >= 0 THEN
+    STORE ALERT_CROSSYEAR INTO [$(vLibOutput)crossyear_gncl_mult_excluded_alerts.csv] (txt);
+  END IF
+  IF Alt(TableNumber('ALERT_BUSINESS_EXCLUDED'),-1) >= 0 THEN
+    STORE ALERT_BUSINESS_EXCLUDED INTO [$(vLibOutput)final_payout_business_excluded_alerts.csv] (txt);
+  END IF
+  IF Alt(TableNumber('ALERT_GLCS_UNMAPPED'),-1) >= 0 THEN
+    STORE ALERT_GLCS_UNMAPPED INTO [$(vLibOutput)glcs_code_unmapped_alerts.csv] (txt);
+  END IF
+  IF Alt(TableNumber('GLCS_EMAIL_UNMATCHED'),-1) >= 0 THEN
+    STORE GLCS_EMAIL_UNMATCHED INTO [$(vLibOutput)glcs_code_unmatched_names_email.csv] (txt);
+  END IF
+  IF Alt(TableNumber('GLCS_EMAIL_SUSPICIOUS'),-1) >= 0 THEN
+    STORE GLCS_EMAIL_SUSPICIOUS INTO [$(vLibOutput)glcs_code_suspicious_numeric_alerts.csv] (txt);
+  END IF
+  STORE AUDIT_ETAPAS INTO [$(vLibOutput)audit_etapas_$(vPayoutYYYYMMDD).csv] (txt);
+  TRACE [CASTINE] Exportação concluída em $(vLibOutput);
+END IF
+
+// E-mail GLCS (send_glcs_unmatched_names_email L3304-3387): sem equivalente
+// nativo em Qlik script. As tabelas GLCS_EMAIL_* reproduzem o conteúdo; o envio
+// é feito por Qlik Application Automation / NPrinting (ver 06_DEPLOYMENT_GUIDE).
+// cleanup_previous_final_payouts (L273-324): deleção de arquivo não existe em
+// script Sense — operacionalizar fora do app (ver 06_DEPLOYMENT_GUIDE §pós-reload).
+
+///$tab 12 — Limpeza do Modelo
+// ============================================================================
+// 12 — remove staging/auditoria auxiliar e, por padrão, as tabelas de alerta
+// (já armazenadas) para evitar chaves sintéticas acidentais no modelo.
+// Modelo final: BLOOMBERG_FINAL_PYTHON_PARITY + AUDIT_ETAPAS + AUDIT_XML_SCAN.
+// ============================================================================
+FOR Each _t in 'XML_FILES', '_VTEAMS', 'SPLIT_VALID', 'FINAL5'
+  IF Alt(TableNumber('$(_t)'), -1) >= 0 THEN
+    DROP TABLE [$(_t)];
+  END IF
+NEXT _t
+
+IF '$(vKeepAlertTables)' = '1' THEN
+  // mantém alertas no modelo com campos qualificados (sem associações acidentais)
+  SUB QualifyTable(pT)
+    IF Alt(TableNumber('$(pT)'), -1) >= 0 THEN
+      FOR _qi = NoOfFields('$(pT)') to 1 step -1
+        LET _qf = FieldName($(_qi), '$(pT)');
+        RENAME FIELD [$(_qf)] TO [$(pT).$(_qf)];
+      NEXT _qi
+    END IF
+  END SUB
+  FOR Each _t in 'ALERT_SPLIT_UNMAPPED','ALERT_REPO_UNMAPPED','ALERT_XML_NONUSD','ALERT_CROSSYEAR','ALERT_BUSINESS_EXCLUDED','ALERT_GLCS_UNMAPPED','SPLIT_CONFIG_ALERTS','TEAM_MISMATCH','GLCS_EMAIL_UNMATCHED','GLCS_EMAIL_SUSPICIOUS'
+    CALL QualifyTable('$(_t)');
+  NEXT _t
+ELSE
+  FOR Each _t in 'ALERT_SPLIT_UNMAPPED','ALERT_REPO_UNMAPPED','ALERT_XML_NONUSD','ALERT_CROSSYEAR','ALERT_BUSINESS_EXCLUDED','ALERT_GLCS_UNMAPPED','SPLIT_CONFIG_ALERTS','TEAM_MISMATCH','GLCS_EMAIL_UNMATCHED','GLCS_EMAIL_SUSPICIOUS'
+    IF Alt(TableNumber('$(_t)'), -1) >= 0 THEN
+      DROP TABLE [$(_t)];
+    END IF
+  NEXT _t
+END IF
+
+TRACE [CASTINE] Reload finalizado. Tabela final: BLOOMBERG_FINAL_PYTHON_PARITY ($(vFinalRows) linhas) | status=$(vParityStatus);
+// ============================================================================
+// FIM — Bloomberg_Python_Parity.qvs
+// ============================================================================
