@@ -1,0 +1,674 @@
+///$tab 00_Main
+SET ThousandSep=',';
+SET DecimalSep='.';
+SET MoneyThousandSep=',';
+SET MoneyDecimalSep='.';
+SET MoneyFormat='$#,##0.00;-$#,##0.00';
+SET TimeFormat='h:mm:ss TT';
+SET DateFormat='M/D/YYYY';
+SET TimestampFormat='M/D/YYYY h:mm:ss[.fff] TT';
+SET FirstWeekDay=6;
+SET BrokenWeeks=1;
+SET ReferenceDay=0;
+SET FirstMonthOfYear=1;
+SET CollationLocale='en-US';
+SET CreateSearchIndexOnReload=1;
+SET MonthNames='Jan;Feb;Mar;Apr;May;Jun;Jul;Aug;Sep;Oct;Nov;Dec';
+SET LongMonthNames='January;February;March;April;May;June;July;August;September;October;November;December';
+SET DayNames='Mon;Tue;Wed;Thu;Fri;Sat;Sun';
+SET LongDayNames='Monday;Tuesday;Wednesday;Thursday;Friday;Saturday;Sunday';
+SET NumericalAbbreviation='3:k;6:M;9:G;12:T;15:P;18:E;21:Z;24:Y;-3:m;-6:μ;-9:n;-12:p;-15:f;-18:a;-21:z;-24:y';
+
+
+
+$(Must_Include=lib://Fldr_QlikShare/SCRIPT/Config_QS.txt);
+
+
+
+///$tab January Comaparison
+// This is for the comparison of the Qlik Export with the Python Export
+
+
+LET vCompare_Date = '20260130';
+
+TRACE Remark: Comparison Date is '$(vCompare_Date)' ;
+
+
+Qlik:
+LOAD
+
+    DATE("As of trade date", 'M/D/YYYY')
+    & '|' & UPPER(Client)
+    & '|' & Security
+    & '|' & TEXT("Trade Id")
+    & '|' & "Trader Team Name"
+    & '|' & ShortDesc
+    & '|' & DATE("Trade Date", 'M/D/YYYY')
+    & '|' & "RR Team"
+    & '|' & "Security Description"
+    & '|' & BuySell
+    & '|' & "Acct Short Description"
+    & '|' & TradeAmount AS CompNum,
+    DATE("As of trade date", 'M/D/YYYY')
+    & '|' & UPPER(Client)
+    & '|' & Security
+    & '|' & TEXT("Trade Id")
+    & '|' & "Trader Team Name"
+    & '|' & ShortDesc
+    & '|' & DATE("Trade Date", 'M/D/YYYY')
+    & '|' & "RR Team"
+    & '|' & "Security Description"
+    & '|' & BuySell
+    & '|' & "Acct Short Description"
+    & '|' & TradeAmount AS CompNum_QLIK,
+    *;
+LOAD
+    DATE("As of trade date", 'M/D/YYYY') AS "As of trade date",
+    UPPER(Client) as Client,
+    Security,
+    TEXT("Trade Id") AS "Trade Id",
+    Salesperson,
+    "Production Earned",
+    "Payout Earned",
+    "Trader Team Name",
+    "Fidelity #",
+    ShortDesc,
+    TradeType,
+    DATE("Trade Date", 'M/D/YYYY') AS "Trade Date",
+    "RR Team",
+    Source,
+    "Security Description",
+    "Gross Comms",
+    "Acct Short Description",
+    BuySell,
+    TradeAmount,
+//    "Currency1",
+    BBG_Filename,
+    Key_TradeFeed_F33642C080CBA825,
+    [Transaction Type]
+//  "Type"
+FROM [lib://Fldr_SDrive/uat/QLIKVIEW/sales/Data/castine/QLIK_PPT_DailyExportOfPayout_$(vCompare_Date).csv]
+(txt, utf8, embedded labels, delimiter is ',', msq)
+WHERE Source = 'Bloomberg XML';
+
+Python:
+load
+
+    DATE("As of trade date", 'M/D/YYYY')
+    & '|' & UPPER(Client)
+    & '|' & Security
+    & '|' & TEXT("Trade Id")
+    & '|' & "Trader Team Name"
+    & '|' & ShortDesc
+    & '|' & DATE("Trade Date", 'M/D/YYYY')
+    & '|' & "RR Team"
+    & '|' & "Security Description"
+    & '|' & BuySell
+    & '|' & "Acct Short Description"
+    & '|' & TradeAmount AS CompNum,
+
+    DATE("As of trade date", 'M/D/YYYY')
+    & '|' & UPPER(Client)
+    & '|' & Security
+    & '|' & TEXT("Trade Id")
+    & '|' & "Trader Team Name"
+    & '|' & ShortDesc
+    & '|' & DATE("Trade Date", 'M/D/YYYY')
+    & '|' & "RR Team"
+    & '|' & "Security Description"
+    & '|' & BuySell
+    & '|' & "Acct Short Description"
+    & '|' & TradeAmount AS [CompNum Python],
+
+    DATE("As of trade date", 'M/D/YYYY') AS "As of trade date Python",
+    UPPER(Client) AS "Client Python",
+    Security  AS "Security Python",
+    TEXT("Trade Id") AS "Trade Id Python",
+    Salesperson AS "Salesperson Python",
+    "Production Earned" AS "Production Earned Python",
+    "Payout Earned" AS "Payout Earned Python",
+    "Trader Team Name" AS  "Trader Team Name Python",
+    "Fidelity #" AS "Fidelity # Python",
+    ShortDesc AS "ShortDesc Python",
+    TradeType AS "TradeType Python",
+    DATE("Trade Date", 'M/D/YYYY') AS "Trade Date Python",
+    "RR Team" AS "RR Team Python",
+    Source AS [Source Python],
+    "Sec Type Description" As "Sec Type Python",
+    "Sec Type Description" AS "Sec Type Description Python",
+    "Security Description" AS "Security Description Python",
+    "Gross Comms" AS "Gross Comm Python",
+    "Acct Short Description" AS "Acct Short Description Python",
+    Currency As "Currency Oython",
+    BuySell AS "BuySell Python",
+    TradeAmount AS "TradeAmount Python"
+//    "GLCS CODE"
+
+FROM [lib://Fldr_SDrive/qlikview/sales/data/daily files/PPT_DailyExportOfPayout_$(vCompare_Date).csv]
+(txt, codepage is 28591, embedded labels, delimiter is ',', msq)
+WHERE Source = 'Bloomberg XML';
+
+EXIT SCRIPT
+
+///$tab 01_Latest_Tiara
+//Find all the files in the Report Control folder and choose the latest version
+// Tiara is supposed to be used later on to find the GLCS Code associated with each trade
+
+
+LET vTiaraAccounts= 'lib://Fldr_SDrive/Qlikview/Sales/Data/Tiara Accounts/';
+
+
+FOR EACH File IN FILELIST('$(vTiaraAccounts)tiara.accounts_*.*')
+
+    LATEST_FILE:
+    LOAD
+        '$(File)' AS FileName_Latest
+        ,FILESIZE( '$(File)' ) AS Size
+        ,DATE(FILETIME( '$(File)' ),'YYYYMMDD')AS FileTime
+        ,SUBFIELD('$(File)','/',-1) AS FileName
+        ,SUBFIELD(SUBFIELD('$(File)','/',-1) ,'.',-1) AS ext
+        ,LEFT(SUBFIELD('$(File)','/',-1),(index(SUBFIELD('$(File)','/',-1) ,'_',-1)-1)) as ShortFileName
+        ,REPLACE(LEFT(SUBFIELD('$(File)','/',-1),(index(SUBFIELD('$(File)','/',-1) ,'_',-1)-1)), '.' ,'_') as StoreFileName
+    AUTOGENERATE 1;
+NEXT File
+
+
+INNER JOIN (LATEST_FILE)
+
+LOAD DISTINCT
+    DATE(MAX(FileTime),'YYYYMMDD') AS FileTime,
+    1 AS LatestVersion
+RESIDENT LATEST_FILE;
+
+
+FOR EACH File IN FILELIST('$(vTiaraAccounts)tiara.subaccounts_*.*')
+
+    subLATEST_FILE:
+    LOAD
+        '$(File)' AS subFileName_Latest
+        ,FILESIZE( '$(File)' ) AS subSize
+        ,DATE(FILETIME( '$(File)' ),'YYYYMMDD')AS subFileTime
+        ,SUBFIELD('$(File)','/',-1) AS subFileName
+        ,SUBFIELD(SUBFIELD('$(File)','/',-1) ,'.',-1) AS subext
+        ,LEFT(SUBFIELD('$(File)','/',-1),(index(SUBFIELD('$(File)','/',-1) ,'_',-1)-1)) as subShortFileName
+        ,REPLACE(LEFT(SUBFIELD('$(File)','/',-1),(index(SUBFIELD('$(File)','/',-1) ,'_',-1)-1)), '.' ,'_') as subStoreFileName
+    AUTOGENERATE 1;
+NEXT File
+
+
+INNER JOIN (subLATEST_FILE)
+
+LOAD DISTINCT
+    DATE(MAX(subFileTime),'YYYYMMDD') AS subFileTime,
+    1 AS subLatestVersion
+RESIDENT subLATEST_FILE;
+
+///$tab 02_AppVariables
+
+// This section is typically used to define variables that are unique to the app and not defined in the config file
+
+
+LET vT_Year_YY = RIGHT(vT_Year, 2);
+///$tab 03_Mappings
+// This section is to define mappings used later on in the code
+
+//Begin looping through the tables
+FOR vtableCount  = 0 to (NoOfRows('LATEST_FILE') -1)
+
+    //Set variable for Table Name and file location
+    LET vShortFileName = PEEK('ShortFileName',$(vtableCount),'LATEST_FILE');
+    LET vFileName_Latest = PEEK('FileName_Latest',$(vtableCount),'LATEST_FILE');
+    LET vStoreFileName = PEEK('StoreFileName',$(vtableCount),'LATEST_FILE');
+
+    TRACE vShortFileName is $(vShortFileName);
+    TRACE vFileName_Latest is $(vFileName_Latest);
+    TRACE vStoreFileName is $(vStoreFileName);
+
+    Tiara_Accts:
+    LOAD *,
+        IF(LEN(BLOOMBERG_MASTER_ACCOUNT_NO) = 0, 'NULL',  TEXT(BLOOMBERG_MASTER_ACCOUNT_NO)) AS  BLOOMBERG_MASTER_ACCOUNT_FLTR
+
+        FROM $(vFileName_Latest)
+        (txt, codepage is 28591, embedded labels, delimiter is '|', msq)
+        WHERE ACCOUNT_TYPE = 'CLIENT' AND ACC_ACTIVE = 1;
+
+NEXT vtableCount
+
+MAP_BBGACCNo_GLCS:
+MAPPING LOAD DISTINCT
+    TEXT(BLOOMBERG_MASTER_ACCOUNT_FLTR) AS BLOOMBERG_MASTER_ACCOUNT_FLTR,
+    TEXT(ENTITY_CODE) AS ENTITY_CODE
+RESIDENT Tiara_Accts
+WHERE BLOOMBERG_MASTER_ACCOUNT_FLTR <> 'NULL';
+
+
+MAP_AccountNr_GLCS:
+MAPPING LOAD DISTINCT
+    TEXT(ACCOUNTNR) AS ACCOUNTNR,
+    TEXT(ENTITY_CODE) AS ENTITY_CODE
+RESIDENT Tiara_Accts;
+
+
+DROP TABLE LATEST_FILE, Tiara_Accts;
+
+
+
+
+
+FOR vtableCount  = 0 to (NoOfRows('subLATEST_FILE') -1)
+
+        //Set variable for Table Name and file location
+        LET vsubShortFileName = PEEK('subShortFileName',$(vtableCount),'subLATEST_FILE');
+        LET vsubFileName_Latest = PEEK('subFileName_Latest',$(vtableCount),'subLATEST_FILE');
+        LET vsubStoreFileName = PEEK('subStoreFileName',$(vtableCount),'subLATEST_FILE');
+
+        TRACE vsubShortFileName is $(vsubShortFileName);
+        TRACE vsubFileName_Latest is $(vsubFileName_Latest);
+        TRACE vsubStoreFileName is $(vsubStoreFileName);
+
+    subTiara_Accts:
+    LOAD *
+    FROM $(vsubFileName_Latest)
+//  FROM [lib://Fldr_SDrive/qlikview/sales/Data/Tiara Accounts/tiara.subaccounts_03082026.txt]
+    (txt, codepage is 28591, embedded labels, delimiter is '|', msq);
+
+NEXT vtableCount
+
+MAP_SubAcctNo_AccountNo:
+MAPPING LOAD DISTINCT
+    TEXT(SUBACCT_NO) AS SUBACCT_NO,
+    TEXT(ACCOUNT_NO) AS ACCOUNT_NO
+RESIDENT subTiara_Accts;
+
+
+DROP TABLE subLATEST_FILE,  subTiara_Accts;
+
+TraderTeamName_PY:
+LOAD
+    UPPER(TraderTeamName_PY) AS TraderTeamName_Exists
+FROM [lib://QlikView SDrive/Qlikview/Sales/Data/Qlik Control Data/Sales_Mapping.xlsx]
+(ooxml, embedded labels, table is TraderTeamName_PY);
+
+
+///$tab 04_SpliMatrix
+//Load split matrix, which defines how the commission should be divided among Salespersons sharing the same [RR  Team] number
+// This sheet be maintained by the business
+// If Expiration Date is blank make it 10 years from now
+
+SplitMatrix:
+LOAD
+    "RR Team",
+    UPPER(TEXT("RR Team")) AS "RR Team Exists",
+    Salesperson,
+    Split,
+    DATE("Effective Date", 'MM/DD/YYYY') AS "Effective Date",
+    IF(ISNULL("Expiration Date") OR LEN("Expiration Date") = 0,DATE(ADDYEARS('$(vToday)', 10), 'MM/DD/YYYY'),DATE("Expiration Date", 'MM/DD/YYYY')) AS "Expiration Date",
+    Notes,
+    "Version Key",
+    "Version Split Sum",
+    "Version Status"
+FROM [$(SDrive_SalesControlData)/RR Teams Split Matrix.xlsx]
+(ooxml, embedded labels, table is Split_Matrix);
+
+
+TRACE Data from '$(SDrive_SalesControlData)'/RR Teams Split Matrix.xlsx loaded;
+///$tab 05_XMLFiles_To_Be_Loaded
+//Find the BBG XML files for the current year from which the Sales Credit data should be loaded e.g. f392fd1.ext.260415.4
+
+// For testing, only the 2026 January Files are considered
+
+FOR EACH File IN FILELIST ('lib://Fldr_SDrive/Trading/bloomberg/ftp/f392fd1.ext.$(vT_Year_YY)01*.4')
+
+    BBG_SalesCredit_Files:
+    LOAD '$(File)'                                          AS FileName,
+        SUBFIELD('$(File)', '/', -1)                         AS File_DatePart,
+        SUBFIELD(SUBFIELD('$(File)', '/', -1), '.', -2)      AS File_Date,
+        FILESIZE('$(File)')                                  AS FileSize,
+        FILETIME('$(File)')                                  AS FileTime
+    AUTOGENERATE 1;
+
+NEXT File
+
+
+
+// For testing, reduce the number of files to the days in January you wish to compare
+
+NOCONCATENATE BBG_SalesCredit_Files_tmp:
+LOAD *
+RESIDENT  BBG_SalesCredit_Files
+WHERE RIGHT(File_Date, 2) <= '30';
+
+DROP TABLE BBG_SalesCredit_Files;
+RENAME TABLE BBG_SalesCredit_Files_tmp TO BBG_SalesCredit_Files;
+
+
+// The date on the latest BBG XML file should determine
+//the YTD repo file that should be loaded
+MaxBBG_Date:
+LOAD MAX(File_Date) AS Max_File_Date
+RESIDENT BBG_SalesCredit_Files;
+
+LET vMax_File_Date = DATE(DATE#(PEEK('Max_File_Date', -1, 'MaxBBG_Date'), 'YYMMDD'), 'YYYYMMDD');
+
+DROP TABLE MaxBBG_Date;
+
+TRACE Remark: Max File Date is '$(vMax_File_Date)' ;
+///$tab 06_Load_BBGXML_TradeData
+LET vTradeFeedTable = 'SalesCredit_TradeFeed';
+
+LET vTransactionCost = 'SalesCredit_TransactionCost';
+
+FOR i = 0 TO NOOFROWS('BBG_SalesCredit_Files') - 1
+
+    LET vBBG_XML_File = PEEK('FileName', i, 'BBG_SalesCredit_Files');
+    LET vFile_DatePart = PEEK('File_DatePart', i, 'BBG_SalesCredit_Files');
+
+
+    $(vTradeFeedTable):
+
+        LOAD
+
+            "RepoFields/TransactionType" AS [Repo Transaction Type],
+            "Common/TransactionNumber" AS [Trade Id],
+            "Common/SecurityIdentifierFlag",
+            "Common/SecurityIdentifier" AS [Security],
+            "Common/SecurityCurrencyISOCode",
+            "Common/SecurityProductKey",
+            "Common/BloombergIdentifier",
+            "Common/Ticker",
+            "Common/CouponStrikePrice",
+            "Common/MaturityDateExpirationDate",
+            "Common/Ticker" & ' ' &    "Common/MaturityDateExpirationDate" AS [Security Description],
+            "Common/BuySellCoverShortFlag" AS [BuySell],
+            "Common/RecordType",
+            DATE(DATE#(SUBFIELD("Common/TradeDate", 'T', 1), 'YYYY-MM-DD'), 'M/D/YYYY')  AS [Trade Date],  //Required format is M/D/YYYY
+            SUBFIELD("Common/TradeDate", 'T', -1) AS [Trade Time],
+            "Common/TradeDate" AS [Trade Date and Time],
+            NUM("Common/TradeDate") AS [Trade Date and Time Num],
+            DATE(DATE#(SUBFIELD("Common/AsOfTradeDate", 'T', 1), 'YYYY-MM-DD'), 'M/D/YYYY') AS [As of trade date],// Required format is M/D/YYYY
+            SUBFIELD("Common/AsOfTradeDate", 'T', -1) AS [As of trade Time],
+            "Common/AsOfTradeDate" AS [As of trade Date and Time],
+
+            "Common/SettlementDate",
+            "Common/Price",
+            "Common/Yield",
+            "Common/TradeAmount" AS [TradeAmount],
+            CHR(39) & "Common/CustomerAccountCounterparty" AS [Acct Short Description],
+            IF(LEN( "Common/CustomerAccountCounterparty") = 0, 'NULL',  "Common/CustomerAccountCounterparty" ) AS [Acct Short Desc Fltr],
+            "Common/TraderAccountName" AS ShortDesc,
+            "Common/TraderAccountNumber" AS [Trader Team Name],
+            "Common/TransactionType" AS [Transaction Type],
+            "Common/OMReasonCode" AS TradeType,
+            "Common/SourceCode" AS SourceCode,
+            "Common/MasterAccountName",
+            IF(ISNULL("Common/MasterAccountName") OR LEN("Common/MasterAccountName") = 0,"Common/AccountCounterpartyShortName","Common/MasterAccountName") AS Client,
+            "Common/OriginalTktId" AS OriginalTktId,
+            "Common/SalespersonName" as [RR Team],
+            'Bloomberg XML' AS Source,
+//          'USD' AS Currency,
+            NULL() AS [Fidelity #],
+            %Key_TradeFeed_F33642C080CBA825,
+            '$(vFile_DatePart)' AS BBG_Filename
+        FROM $(vBBG_XML_File)
+//      FROM [lib://Fldr_SDrive/Trading/bloomberg/ftp/f392fd1.ext.260414.4]
+        (XmlSimple, table is [BatchFeed/TradeFeed])
+        WHERE TRIM(UPPER("Common/MasterAccountName")) <> 'TEST'
+        AND INDEX(UPPER("Common/TransactionType"), 'X') = 0
+        AND LEN("Common/SalespersonName")  <> 0
+        AND NOT ISNULL("Common/SalespersonName")
+        AND EXISTS("RR Team Exists", UPPER(TEXT("Common/SalespersonName"))) // Only include RR Teams that are in Split matrix
+        AND (YEAR("Common/AsOfTradeDate") = $(vLastWorkDate_Year) OR
+         (YEAR("Common/AsOfTradeDate") = $(vLastWorkDate_PriorYear)
+        AND EXISTS(TraderTeamName_Exists, UPPER("Common/TraderAccountNumber"))));
+//      AND %Key_TradeFeed_F33642C080CBA825 = 573725;
+//      AND EXISTS(Key_TradeFeed_F33642C080CBA825_exists, %Key_TradeFeed_F33642C080CBA825);
+
+    TRACE  Sales Credit Data loaded from $(vFile_DatePart) for the trade year  $(vLastWorkDate_Year) has been loaded;
+
+
+
+
+    $(vTransactionCost):
+        LOAD DISTINCT
+            "Type",
+            Currency,
+            Code,
+            Cost,
+            //Cost AS [Production Earned],
+            "Rate",
+            CurrencyRate,
+            Override,
+            %Key_TradeFeed_F33642C080CBA825,
+            '$(vFile_DatePart)' AS BBG_Filename
+        FROM $(vBBG_XML_File)
+//      FROM [lib://Fldr_SDrive/Trading/bloomberg/ftp/f392fd1.ext.260817.4]
+        (XmlSimple, table is [BatchFeed/TradeFeed/TransactionCosts/TransactionCost]);
+//      WHERE %Key_TradeFeed_F33642C080CBA825 = 573725;
+//      WHERE EXISTS(Key_TradeFeed_F33642C080CBA825_exists,  %Key_TradeFeed_F33642C080CBA825);
+
+    TRACE  Cost Data loaded from $(vFile_DatePart) for the trade year  $(vLastWorkDate_Year) has been loaded;
+
+NEXT;
+
+
+
+//Keep the latest version of tickets with the same Common/OriginalTktId
+INNER JOIN ($(vTradeFeedTable))
+LOAD OriginalTktId,
+MAX([Trade Date and Time Num])  AS  [Trade Date and Time Num]
+RESIDENT  $(vTradeFeedTable)
+GROUP BY OriginalTktId;
+
+
+
+
+
+
+
+
+///$tab 07_Aggregate_Cost
+NOCONCATENATE
+SalesCredit_TransactionCost_NR_R:
+    LOAD DISTINCT
+            CONCAT(DISTINCT "Type", '|') AS Type_NR,
+            CONCAT(DISTINCT Currency, '|') AS Currency_NR,
+//          Code,
+            SUM(Cost) AS Cost_NR,
+
+//          "Rate",
+//          CurrencyRate,
+//          Override,
+            %Key_TradeFeed_F33642C080CBA825,
+            BBG_Filename
+    RESIDENT SalesCredit_TransactionCost
+    WHERE UPPER(Type) <> 'R'
+        AND Currency = 'USD'
+    GROUP BY  %Key_TradeFeed_F33642C080CBA825,
+            BBG_Filename;
+
+    OUTER JOIN (SalesCredit_TransactionCost_NR_R)
+    LOAD DISTINCT
+            CONCAT(DISTINCT "Type", '|') AS Type_R,
+            CONCAT(DISTINCT Currency, '|') AS Currency_R,
+//          Code,
+            SUM(Cost) AS Cost_R,
+//          "Rate",
+//          CurrencyRate,
+//          Override,
+            %Key_TradeFeed_F33642C080CBA825,
+            BBG_Filename
+    RESIDENT SalesCredit_TransactionCost
+    WHERE UPPER(Type) = 'R'
+        AND Currency = 'USD'
+    GROUP BY  %Key_TradeFeed_F33642C080CBA825,
+            BBG_Filename;
+
+DROP TABLE SalesCredit_TransactionCost;
+
+NOCONCATENATE
+SalesCredit_TransactionCost:
+    LOAD DISTINCT
+            IF(ISNULL(Type_NR) OR LEN(Type_NR) = 0, '',  Type_NR) & IF(ISNULL(Type_R) OR LEN(Type_R) = 0, '', '|' & Type_R) AS "Type" ,
+            Type_NR & '' & Type_R AS "Type2",
+            IF(ISNULL(Currency_NR) OR LEN(Currency_NR) = 0, '',  Currency_NR) & IF(ISNULL(Currency_R) OR LEN(Currency_R) = 0, '', '|' & Currency_R) AS "Currency1",
+//          Code,
+            IF (ISNULL(Cost_NR) OR LEN(Cost_NR) = 0, 0, Cost_NR) + IF (ISNULL(Cost_R) OR LEN(Cost_R) = 0, 0, Cost_R) AS  [Gross Comms],
+//          "Rate",
+//          CurrencyRate,
+//          Override,
+            %Key_TradeFeed_F33642C080CBA825,
+            BBG_Filename
+    RESIDENT SalesCredit_TransactionCost_NR_R;
+
+    DROP TABLE SalesCredit_TransactionCost_NR_R;
+
+
+    //Join 'SalesCredit_TransactionCost' with 'SalesCredit_TradeFeed';
+
+    LEFT JOIN ($(vTradeFeedTable))
+    LOAD DISTINCT %Key_TradeFeed_F33642C080CBA825,
+            BBG_Filename,
+            "Type",
+            "Currency1",
+            [Gross Comms]
+    RESIDENT SalesCredit_TransactionCost;
+
+
+    DROP TABLE SalesCredit_TransactionCost;
+
+
+
+///$tab 08_Repo_YTD
+// Append repo YTD to compiled BBG XML trades
+
+
+    CONCATENATE ($(vTradeFeedTable))
+
+    LOAD
+        DATE(REPLACE("T/D", '\', '/'),'M/D/YYYY') AS  [As of trade date],
+        Account AS Client,
+        Cusip AS Security,
+        "Trans#" AS [Trade Id],
+        Trader AS [Trader Team Name],
+        NULL() AS [Fidelity #],
+        Trader AS ShortDesc,
+        "TR/TYPE" AS  [TradeType],
+        DATE(REPLACE("T/D", '\', '/'),'M/D/YYYY') AS  [Trade Date],
+//      SalesPerson AS [RR Team],
+        'Repo' AS Source,
+        UPPER(AssetClass) AS [Sec Type],
+        UPPER(AssetClass) AS [Sec Type Description],
+        UPPER(SecurityDescription) AS [Security Description],
+        "Net Credit" AS [Gross Comms],
+        CHR(39) & Account AS [Acct Short Description],
+        'USD' AS Currency,
+        'B' AS BuySell,
+        Principal AS TradeAmount
+    FROM [lib://Fldr_SDrive/Operations/BroadridgeData/Reports/$(vMax_File_Date)/YTDSalesCommission_$(vMax_File_Date).csv]
+//  FROM [lib://Fldr_SDrive/Operations/BroadridgeData/Reports/20260101/YTDSalesCommission_20260101.csv]
+    (txt, codepage is 28591, embedded labels, delimiter is ',', msq);
+
+
+///$tab 09_Append_GLCS_Code
+
+///$tab 10_Merge_SplitMatrix
+// Join split matrix  to resultin trades file to determine commission for individual sales persone
+
+
+    LEFT JOIN ($(vTradeFeedTable))
+    LOAD DISTINCT
+        "RR Team",
+        Salesperson,
+        Split,
+        "Effective Date",
+        IF(ISNULL("Expiration Date") OR LEN("Expiration Date") = 0,DATE(ADDYEARS('$(vToday)', 10), 'MM/DD/YYYY'),DATE("Expiration Date", 'MM/DD/YYYY')) AS "Expiration Date"
+    RESIDENT SplitMatrix;
+
+    DROP TABLE SplitMatrix;
+
+
+
+
+
+///$tab 11_Export CSV
+// Create a new table with combined data from BBG XML, Repo and Split Matrix
+// Export a csv from that combined table
+
+NOCONCATENATE $(vTradeFeedTable)_Tmp:
+LOAD  DATE("As of trade date", 'M/D/YYYY') AS "As of trade date",
+    Client,
+    Security,
+    "Trade Id",
+    Salesperson,
+    [Gross Comms] * Split AS "Production Earned",
+    [Gross Comms] * Split AS "Payout Earned",
+    "Trader Team Name",
+    "Fidelity #",
+    ShortDesc,
+    TradeType,
+    DATE("Trade Date", 'M/D/YYYY') AS "Trade Date",
+    "RR Team",
+    Source,
+//  "Sec Type",
+//  "Sec Type Description",
+    "Security Description",
+    "Gross Comms",
+    LEN([Gross Comms]) AS "Gross Comms LEN",
+    "Acct Short Description",
+    Currency,
+    BuySell,
+    TradeAmount,
+
+//  "Currency1"
+    %Key_TradeFeed_F33642C080CBA825 AS Key_TradeFeed_F33642C080CBA825,
+    BBG_Filename,
+    [Transaction Type]
+//  "Type"
+RESIDENT $(vTradeFeedTable)
+WHERE LEN([Gross Comms]) > 0 OR ISNULL ([Gross Comms]) ;
+
+
+DROP TABLE $(vTradeFeedTable);
+
+RENAME TABLE $(vTradeFeedTable)_Tmp TO $(vTradeFeedTable);
+
+
+
+
+STORE $(vTradeFeedTable) INTO [$(SDrive)/UAT/Qlikview/Sales/Data/castine/QLIK_PPT_DailyExportOfPayout_$(vMax_File_Date).csv] (txt);
+
+
+
+TRACE Remark: Data from [lib://Fldr_SDrive/Operations/BroadridgeData/Reports/$(vMax_File_Date)/YTDSalesCommission_$(vMax_File_Date).csv] are loaded;
+
+
+///$tab 12_End
+EXIT SCRIPT
+
+/***************************** KEEP THE FOLLOW CODE ***************************************************************
+************************* IT GIVES THE ORDER IN WHICH THE FIELDS IN THE EXPORTED FILE SHOULD BE *********/
+
+
+// NOCONCATENATE
+// ExportFile:
+// LOAD
+//     "As of trade date",
+//     Client,
+//     Security,
+//     "Trade Id",
+//     Salesperson,
+//     "Production Earned",
+//     "Payout Earned",
+//     "Trader Team Name",
+//     "Fidelity #",
+//     ShortDesc,
+//     TradeType,
+//     "Trade Date",
+//     "RR Team",
+//     Source,
+//     "Sec Type",
+//     "Sec Type Description",
+//     "Security Description",
+//     "Gross Comms",
+//     "Acct Short Description",
+//     Currency,
